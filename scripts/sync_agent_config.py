@@ -23,6 +23,7 @@ OPENCLAW_CFG = OPENCLAW_HOME / 'openclaw.json'
 
 ID_LABEL = {
     'main':     {'label': '鲍澄',   'role': '项目负责人', 'duty': '需求分析、调度决策、最终交付', 'emoji': '🏛️'},
+    'ld-r':     {'label': 'Ld.r',   'role': '执行经理',   'duty': '项目管理、方案执行、督办推进', 'emoji': '📮'},
     'guihua':   {'label': '筹微',   'role': '规划师',     'duty': '需求拆解、生成TASK.md',          'emoji': '📜'},
     'shenyi':   {'label': '审微',   'role': '审议官',     'duty': '独立审查、准奏或封驳',            'emoji': '🔍'},
     'paifa':    {'label': '驿使',   'role': '派发官',     'duty': '任务路由、派发到执行部门',        'emoji': '📮'},
@@ -31,6 +32,7 @@ ID_LABEL = {
     'sheji':    {'label': '绘象',   'role': '视觉设计',   'duty': '视觉规范、UI设计、生图',          'emoji': '🎨'},
     'shencha':  {'label': '镜衡',   'role': '质量审查',   'duty': '独立质量验收、对照标准评分',      'emoji': '⚖️'},
     'huizong':  {'label': '归藏',   'role': '项目汇总',   'duty': '整合交付、生成交付报告',          'emoji': '📋'},
+    'rongcui':  {'label': '溶萃',   'role': '全能工程师', 'duty': '运维部署、技术支持、特殊任务',    'emoji': '🔧'},
 }
 
 KNOWN_MODELS = [

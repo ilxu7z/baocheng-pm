@@ -113,6 +113,8 @@ def detect_official(agent_id):
         'sheji':   ('绘象', '三省-绘象'),
         'shencha': ('镜衡', '三省-镜衡'),
         'huizong': ('归藏', '三省-归藏'),
+        'ld-r':    ('尚书令', '尚书省'),
+        'rongcui': ('钦天监', '钦天监'),
     }
     return mapping.get(agent_id, ('尚书令', '尚书省'))
 
