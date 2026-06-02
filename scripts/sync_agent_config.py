@@ -248,6 +248,8 @@ def main():
             allow_agents = ag.get('allowAgents', []) or []
         else:
             allow_agents = (ag.get('subagents') or {}).get('allowAgents', []) if isinstance(ag.get('subagents'), dict) else []
+            if not isinstance(allow_agents, list):
+                allow_agents = []
         agent_skills = get_skills(workspace)
         merged = _merge_skills(global_skills, agent_skills, ag_id)
         result.append({

@@ -3,12 +3,12 @@
 MACS-pm OpenClaw Runtime Session Scanner (v2 — OpenClaw 5.12+ / 5.28+ compatible)
 
 Changelog v2 (2026-06-02):
-- parse_timestamp(): 兼容 int ms / ISO 8601 string / None 三种时间戳格式
-- safe_nested_get(): 嵌套 dict 安全取值，任意层返回 None 不掉
-- sessionFile: 路径存在性校验，不存在则跳过 activity 加载
-- origin.label: fallback 到 sessionId 防 lineage metadata 格式变化
-- abortedLastRun: fallback 到 raw state==error 检测
-- top-level sessions.json: 兼容 dict 和 list 两种顶层格式
+- parse_timestamp(): 兼容 int ms / ISO 8601 string / None 三种时间戳格式（含 bool instanceof 保护）
+- load_sessions(): sessions.json 兼容 dict / list 两种顶层格式
+- sessionFile: transcriptPath fallback + 路径存在性校验，不存在时跳过 activity 加载
+- origin: 非 dict 时安全 fallback 到空 dict
+- abortedLastRun: 兜底 state=='error' 检测
+- token 字段: snake_case 兼容
 """
 import json
 import os
@@ -59,7 +59,7 @@ def parse_timestamp(ts_raw):
     """兼容 int ms / ISO 8601 string / None 三种时间戳格式（5.12 → 5.28+ 向前兼容）"""
     if ts_raw is None:
         return 0
-    if isinstance(ts_raw, (int, float)):
+    if isinstance(ts_raw, (int, float)) and not isinstance(ts_raw, bool):
         return int(ts_raw)
     if isinstance(ts_raw, str):
         try:
