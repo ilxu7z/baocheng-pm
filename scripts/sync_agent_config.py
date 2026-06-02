@@ -2,6 +2,11 @@
 """
 同步 openclaw.json 中的 agent 配置 → data/agent_config.json
 支持自动发现 agent workspace 下的 Skills 目录
+
+Changelog v2 (2026-06-02):
+- _collect_openclaw_models(): 修复 providers 路径 (cfg.providers → cfg.models.providers)，修复自定义 provider 模型不出现
+- get_skills(): 加 workspace 目录存在性校验
+- allowAgents: 兼容 ag.subagents.allowAgents 和 ag.allowAgents 两种位置
 """
 import json, os, pathlib, datetime, logging
 from file_lock import atomic_json_write
@@ -118,8 +123,13 @@ def _scan_global_skills():
 
 
 def get_skills(workspace: str):
-    """获取 Agent 私有技能（workspace-{agent}/skills/ 目录下）。"""
-    skills_dir = pathlib.Path(workspace) / 'skills'
+    """获取 Agent 私有技能（workspace-{agent}/skills/ 目录下）。
+    5.28+ 兼容：先校验 workspace 目录是否实际存在。"""
+    ws_path = pathlib.Path(workspace)
+    if not ws_path.exists():
+        log.debug(f'workspace does not exist: {workspace}')
+        return []
+    skills_dir = ws_path / 'skills'
     skills = []
     try:
         if skills_dir.exists():
@@ -197,7 +207,9 @@ def _collect_openclaw_models(cfg):
             extra.append({'id': m, 'label': m, 'provider': 'OpenClaw'})
             known_ids.add(m)
     # 收集 providers 中的 model id（如 copilot-proxy、anthropic 等）
-    for pname, pcfg in cfg.get('providers', {}).items():
+    # 5.28+ 兼容：cfg.models.providers（正确路径），兜底 cfg.providers（旧版兼容）
+    providers_cfg = cfg.get('models', {}).get('providers', {}) or cfg.get('providers', {})
+    for pname, pcfg in providers_cfg.items():
         for mid in (pcfg.get('models') or []):
             mid_str = mid if isinstance(mid, str) else (mid.get('id') or mid.get('name') or '')
             if mid_str and mid_str not in known_ids:
@@ -229,10 +241,11 @@ def main():
             continue
         meta = ID_LABEL[ag_id]
         workspace = ag.get('workspace', str(OPENCLAW_HOME / f'workspace-{ag_id}'))
+        # 5.28+ 兼容：allowAgents 可能在 ag.allowAgents 或 ag.subagents.allowAgents
         if 'allowAgents' in ag:
             allow_agents = ag.get('allowAgents', []) or []
         else:
-            allow_agents = ag.get('subagents', {}).get('allowAgents', [])
+            allow_agents = (ag.get('subagents') or {}).get('allowAgents', []) if isinstance(ag.get('subagents'), dict) else []
         agent_skills = get_skills(workspace)
         merged = _merge_skills(global_skills, agent_skills, ag_id)
         result.append({

@@ -1,4 +1,15 @@
 #!/usr/bin/env python3
+"""
+MACS-pm OpenClaw Runtime Session Scanner (v2 — OpenClaw 5.12+ / 5.28+ compatible)
+
+Changelog v2 (2026-06-02):
+- parse_timestamp(): 兼容 int ms / ISO 8601 string / None 三种时间戳格式
+- safe_nested_get(): 嵌套 dict 安全取值，任意层返回 None 不掉
+- sessionFile: 路径存在性校验，不存在则跳过 activity 加载
+- origin.label: fallback 到 sessionId 防 lineage metadata 格式变化
+- abortedLastRun: fallback 到 raw state==error 检测
+- top-level sessions.json: 兼容 dict 和 list 两种顶层格式
+"""
 import json
 import os
 import pathlib
@@ -42,6 +53,51 @@ def state_from_session(age_ms, aborted):
     if age_ms <= 60 * 60 * 1000:
         return 'Review'
     return 'Next'
+
+
+def parse_timestamp(ts_raw):
+    """兼容 int ms / ISO 8601 string / None 三种时间戳格式（5.12 → 5.28+ 向前兼容）"""
+    if ts_raw is None:
+        return 0
+    if isinstance(ts_raw, (int, float)):
+        return int(ts_raw)
+    if isinstance(ts_raw, str):
+        try:
+            dt = datetime.datetime.fromisoformat(ts_raw.replace('Z', '+00:00'))
+            return int(dt.timestamp() * 1000)
+        except (ValueError, AttributeError):
+            return 0
+    return 0
+
+
+def safe_nested_get(d, *keys, default=None):
+    """嵌套 dict 安全取值：任意层为 None/非 dict 时返回 default 不掉。"""
+    cur = d
+    for k in keys:
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(k)
+        if cur is None:
+            return default
+    return cur if cur is not None else default
+
+
+def load_sessions(sessions_file: pathlib.Path):
+    """加载 sessions.json，兼容 dict / list 两种顶层格式（5.12 dict, 5.28+ 可能变为 list of dicts）"""
+    try:
+        raw = json.loads(sessions_file.read_text())
+    except Exception:
+        return []  # 文件损坏/不存在，返回空
+    if isinstance(raw, dict):
+        return [(session_key, row) for session_key, row in raw.items() if isinstance(row, dict)]
+    if isinstance(raw, list):
+        items = []
+        for item in raw:
+            if isinstance(item, dict):
+                sk = item.get('sessionKey') or item.get('sessionId') or item.get('key') or ''
+                items.append((sk, item))
+        return items
+    return []
 
 
 def detect_official(agent_id):
@@ -145,26 +201,41 @@ def load_activity(session_file, limit=12):
 
 
 def build_task(agent_id, session_key, row, now_ms):
-    session_id = row.get('sessionId') or session_key
-    updated_at = row.get('updatedAt') or 0
+    # ── 字段提取（全部 safe_get，向前兼容变更）──
+    session_id = row.get('sessionId') or row.get('id') or session_key
+
+    # updatedAt: 兼容 int ms / ISO 8601 / None
+    updated_at = parse_timestamp(row.get('updatedAt'))
+
+    # aborted: 兜底检测 state==error
+    aborted = bool(row.get('abortedLastRun') or row.get('state') == 'error')
+
     age_ms = max(0, now_ms - updated_at) if updated_at else 99 * 24 * 3600 * 1000
-    aborted = bool(row.get('abortedLastRun'))
     state = state_from_session(age_ms, aborted)
 
     official, org = detect_official(agent_id)
-    channel = row.get('lastChannel') or (row.get('origin') or {}).get('channel') or '-'
-    session_file = row.get('sessionFile', '')
-    
-    # 尝试从 activity 获取更有意义的当前状态描述
+
+    # origin: 5.28+ 可能加 namespace 嵌套，安全取值
+    origin = row.get('origin') if isinstance(row.get('origin'), dict) else {}
+    channel = row.get('lastChannel') or origin.get('channel') or '-'
+    title_label = origin.get('label') or session_key or ''
+
+    # sessionFile: 5.28+ transcript 路径可能重写，加存在性校验
+    session_file = row.get('sessionFile') or row.get('transcriptPath') or ''
+    session_file_exists = bool(session_file and pathlib.Path(session_file).exists())
+
+    # ── Activity 提取 ──
     latest_act = '等待指令'
-    acts = load_activity(session_file, limit=5)
-    
-    # If the absolute latest is a tool result, look for the preceding assistant thought
-    # because that explains *why* the tool was called.
+    acts = []
+    if session_file_exists:
+        try:
+            acts = load_activity(session_file, limit=5)
+        except Exception:
+            acts = []
+
     if acts:
         first_act = acts[0]
         if first_act['kind'] == 'tool' and len(acts) > 1:
-            # Look for next assistant message (which is actually previous in time)
             for next_act in acts[1:]:
                 if next_act['kind'] == 'assistant':
                     latest_act = f"正在执行: {next_act['text'][:80]}"
@@ -172,12 +243,11 @@ def build_task(agent_id, session_key, row, now_ms):
             else:
                 latest_act = first_act['text'][:60]
         elif first_act['kind'] == 'assistant':
-             latest_act = f"思考中: {first_act['text'][:80]}"
+            latest_act = f"思考中: {first_act['text'][:80]}"
         else:
-             latest_act = acts[0]['text'][:60]
-    
-    title_label = (row.get('origin') or {}).get('label') or session_key
-    # 清洗会话标题：agent:xxx:cron:uuid → 定时任务, agent:xxx:subagent:uuid → 子任务
+            latest_act = acts[0]['text'][:60]
+
+    # ── 标题推断 ──
     import re
     if re.match(r'agent:\w+:cron:', title_label):
         title = f"{org}定时任务"
@@ -187,7 +257,12 @@ def build_task(agent_id, session_key, row, now_ms):
         title = f"{org}会话"
     else:
         title = f"{title_label}"
-    
+
+    # ── token 统计（兼容字段名变化）──
+    input_tokens = row.get('inputTokens') or row.get('input_tokens')
+    output_tokens = row.get('outputTokens') or row.get('output_tokens')
+    total_tokens = row.get('totalTokens') or row.get('total_tokens')
+
     return {
         'id': f"JJC-AUTO-{agent_id}-{hashlib.md5(session_key.encode()).hexdigest()[:10]}",
         'title': title,
@@ -204,7 +279,7 @@ def build_task(agent_id, session_key, row, now_ms):
             'dispatch': f"sessionKey={session_key}",
         },
         'ac': '来自 OpenClaw runtime sessions 的实时映射',
-        'activity': load_activity(session_file, limit=10),
+        'activity': load_activity(session_file, limit=10) if session_file_exists else [],
         'sourceMeta': {
             'agentId': agent_id,
             'sessionKey': session_key,
@@ -213,9 +288,9 @@ def build_task(agent_id, session_key, row, now_ms):
             'ageMs': age_ms,
             'systemSent': bool(row.get('systemSent')),
             'abortedLastRun': aborted,
-            'inputTokens': row.get('inputTokens'),
-            'outputTokens': row.get('outputTokens'),
-            'totalTokens': row.get('totalTokens'),
+            'inputTokens': input_tokens,
+            'outputTokens': output_tokens,
+            'totalTokens': total_tokens,
         }
     }
 
@@ -239,18 +314,15 @@ def main():
                     continue
                 scan_files += 1
 
-                try:
-                    raw = json.loads(sessions_file.read_text())
-                except Exception:
-                    continue
-
-                if not isinstance(raw, dict):
-                    continue
-
-                for session_key, row in raw.items():
-                    if not isinstance(row, dict):
+                # 使用向前兼容的 load_sessions（dict + list 双格式）
+                rows = load_sessions(sessions_file)
+                for session_key, row in rows:
+                    if not session_key:
                         continue
-                    tasks.append(build_task(agent_id, session_key, row, now_ms))
+                    try:
+                        tasks.append(build_task(agent_id, session_key, row, now_ms))
+                    except Exception as be:
+                        log.warning(f'build_task failed for {agent_id}/{session_key}: {be}')
 
         # merge mission control tasks (最小接入)
         mc_tasks_file = DATA / 'mission_control_tasks.json'
