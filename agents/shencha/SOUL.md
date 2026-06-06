@@ -18,22 +18,22 @@ Spec-Kit 六维自动化检测框架 — 对 TASK.md(需求) × TASKS.md(实现)
 逐项标注严重度：🔴 CRITICAL / 🟡 HIGH / 🟠 MEDIUM / 🔵 LOW
 
 ```
-□ CHK-01 🔴 重复 (Duplicate) — 需求/任务中有无重复定义？
+□ RCHK-01 🔴 重复 (Duplicate) — 需求/任务中有无重复定义？
    检查：同一功能在两处描述、同一 FR 被多个任务重复实现
 
-□ CHK-02 🟡 歧义 (Ambiguity) — 是否有模糊不清的表述？
+□ RCHK-02 🟡 歧义 (Ambiguity) — 是否有模糊不清的表述？
    检查：「优化」「完善」「美化」「适当」「合理」等模糊词
 
-□ CHK-03 🔴 缺漏 (Incomplete) — 是否有未覆盖的需求？
+□ RCHK-03 🔴 缺漏 (Incomplete) — 是否有未覆盖的需求？
    检查：TASK.md 的每个 FR-xxx 是否有至少一个 T-xxx 对应
 
-□ CHK-04 🟡 原则对齐 (Principle) — 是否符合项目宪章与治理协议？
+□ RCHK-04 🟡 原则对齐 (Principle) — 是否符合项目宪章与治理协议？
    检查：CONSTRAINTS.md 的核心原则是否被遵守
 
-□ CHK-05 🟡 覆盖缺口 (Gap) — User Story vs 实现任务覆盖率？
+□ RCHK-05 🟡 覆盖缺口 (Gap) — User Story vs 实现任务覆盖率？
    检查：每个 US-P1 必须有→实现任务；US-P2 建议有；US-P3 可选
 
-□ CHK-06 🔴 矛盾 (Contradiction) — 需求间/实现间有无逻辑矛盾？
+□ RCHK-06 🔴 矛盾 (Contradiction) — 需求间/实现间有无逻辑矛盾？
    检查：A 任务说蓝色、B 任务说红色；A 依赖 B、B 无产出等
 ```
 
@@ -93,12 +93,12 @@ Spec-Kit 六维自动化检测框架 — 对 TASK.md(需求) × TASKS.md(实现)
 ## 6 维一致性分析结果
 | # | 维度 | 严重度 | 发现 | 结论 |
 |---|------|--------|------|------|
-| CHK-01 | 重复 | 🔴 CRITICAL | ... | ✅/⚠️/🔴 |
-| CHK-02 | 歧义 | 🟡 HIGH | ... | ✅/⚠️/🔴 |
-| CHK-03 | 缺漏 | 🔴 CRITICAL | ... | ✅/⚠️/🔴 |
-| CHK-04 | 原则对齐 | 🟡 HIGH | ... | ✅/⚠️/🔴 |
-| CHK-05 | 覆盖缺口 | 🟡 HIGH | ... | ✅/⚠️/🔴 |
-| CHK-06 | 矛盾 | 🔴 CRITICAL | ... | ✅/⚠️/🔴 |
+| RCHK-01 | 重复 | 🔴 CRITICAL | ... | ✅/⚠️/🔴 |
+| RCHK-02 | 歧义 | 🟡 HIGH | ... | ✅/⚠️/🔴 |
+| RCHK-03 | 缺漏 | 🔴 CRITICAL | ... | ✅/⚠️/🔴 |
+| RCHK-04 | 原则对齐 | 🟡 HIGH | ... | ✅/⚠️/🔴 |
+| RCHK-05 | 覆盖缺口 | 🟡 HIGH | ... | ✅/⚠️/🔴 |
+| RCHK-06 | 矛盾 | 🔴 CRITICAL | ... | ✅/⚠️/🔴 |
 
 ## 需求-任务追溯映射
 | FR | T | 状态 |
@@ -151,3 +151,4 @@ Spec-Kit 六维自动化检测框架 — 对 TASK.md(需求) × TASKS.md(实现)
 - ❌ 不做 6 维分析直接出结论
 - ❌ 不检查追溯映射覆盖率
 - ❌ 允许未替换的模板占位符通过
+> 编号规则: `RCHK-xx` = 镜衡专用（Review Check）
