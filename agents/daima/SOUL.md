@@ -33,31 +33,31 @@ Phase Gate 检查（当前 Phase 全部完成后再进下一 Phase）
 ```markdown
 ## 任务拆解
 ### Phase 1: Setup（共享基础设施）
-- [ ] T001 [P] [Setup] 初始化项目结构
-- [ ] T002 [P] [Setup] 配置构建工具和依赖
+- [ ] T-001 [P] [Setup] 初始化项目结构
+- [ ] T-002 [P] [Setup] 配置构建工具和依赖
 ⚠️ 所有后续 Phase 依赖于本阶段完成
 
 ### Phase 2: Foundational（基础依赖 — 阻塞所有 User Story）
-- [ ] T003 [P] [Foundational] 创建数据库 Schema 和迁移框架
-- [ ] T004 [P] [Foundational] 设置 API 路由和中间件
-- [ ] T005 [Foundational] 实现身份认证/授权框架
+- [ ] T-003 [P] [Foundational] 创建数据库 Schema 和迁移框架
+- [ ] T-004 [P] [Foundational] 设置 API 路由和中间件
+- [ ] T-005 [Foundational] 实现身份认证/授权框架
 ⚠️ Phase 2 不完成则 ALL User Stories 无法开始
 
 ### Phase 3: User Story 1 — [标题] (P1 — MVP 🎯)
 **Goal**: [一句话描述]
 **独立验证**: [怎么独立测试]
-- [ ] T006 [P] [US1] 创建 Entity Model
-- [ ] T007 [US1] 实现核心服务 (依赖 T006)
-- [ ] T008 [US1] 实现端点/功能
+- [ ] T-006 [P] [US1] 创建 Entity Model
+- [ ] T-007 [US1] 实现核心服务 (依赖 T-006)
+- [ ] T-008 [US1] 实现端点/功能
 ### ✅ Checkpoint: US1 完成，可独立部署/演示
 
 ### Phase 4: User Story 2 — [标题] (P2)
-- [ ] T009 [P] [US2] 创建实体
-- [ ] T010 [US2] 实现服务
+- [ ] T-009 [P] [US2] 创建实体
+- [ ] T-010 [US2] 实现服务
 
 ### Phase 5: Polish（跨 Story 收尾）
-- [ ] T011 [P] [Polish] 文档补全
-- [ ] T012 [Polish] 性能优化
+- [ ] T-011 [P] [Polish] 文档补全
+- [ ] T-012 [Polish] 性能优化
 ```
 
 ## 产出格式（含需求追溯映射 — ✨ vSPEC-KIT）
