@@ -45,11 +45,14 @@ SCAN_INTERVAL="${2:-120}"  # 巡检间隔(秒), 默认 120
 SCAN_COUNTER=0
 SCRIPT_TIMEOUT=30  # 单个脚本最大执行时间(秒)
 DASHBOARD_PORT="${EDICT_DASHBOARD_PORT:-7891}"  # 看板端口，可通过环境变量覆盖
+CLEANUP_INTERVAL=$((4 * 3600))  # Session 清理间隔(秒), 默认 4 小时
+CLEANUP_COUNTER=0
 
 echo "🏛️  三省六部数据刷新循环启动 (PID=$$)"
 echo "   脚本目录: $SCRIPT_DIR"
 echo "   间隔: ${INTERVAL}s"
 echo "   巡检间隔: ${SCAN_INTERVAL}s"
+echo "   清理间隔: ${CLEANUP_INTERVAL}s"
 echo "   脚本超时: ${SCRIPT_TIMEOUT}s"
 echo "   日志: $LOG"
 echo "   PID文件: $PIDFILE"
@@ -85,6 +88,14 @@ while true; do
     SCAN_COUNTER=0
     curl -s -X POST "http://127.0.0.1:${DASHBOARD_PORT}/api/scheduler-scan" \
       -H 'Content-Type: application/json' -d '{"thresholdSec":180}' >> "$LOG" 2>&1 || true
+  fi
+
+  # 定期清理：清理过期 session 文件，防止膨胀
+  CLEANUP_COUNTER=$((CLEANUP_COUNTER + INTERVAL))
+  if (( CLEANUP_COUNTER >= CLEANUP_INTERVAL )); then
+    CLEANUP_COUNTER=0
+    echo "$(date '+%H:%M:%S') [loop] 🧹 开始 session 清理" >> "$LOG"
+    "$PYTHON_BIN" "$SCRIPT_DIR/session_cleaner.py" >> "$LOG" 2>&1 || true
   fi
 
   sleep "$INTERVAL"
