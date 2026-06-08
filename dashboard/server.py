@@ -2658,7 +2658,11 @@ class Handler(BaseHTTPRequestHandler):
         if self._check_auth():
             return
         if p in ('', '/dashboard', '/dashboard.html'):
-            self.send_file(DIST / 'index.html')
+            idx = DIST / 'index.html'
+            if idx.exists():
+                self.send_file(idx)
+            else:
+                self.send_file(BASE / 'dashboard.html')
         elif p == '/healthz':
             task_data_dir = get_task_data_dir()
             checks = {'dataDir': task_data_dir.is_dir(), 'tasksReadable': (task_data_dir / 'tasks_source.json').exists()}
@@ -2766,12 +2770,14 @@ class Handler(BaseHTTPRequestHandler):
         elif self._serve_static(p):
             pass  # 已由 _serve_static 处理 (JS/CSS/图片等)
         else:
-            # SPA fallback：非 /api/ 路径返回 index.html
+            # SPA fallback：非 /api/ 路径返回 index.html，无则 dashboard.html
             if not p.startswith('/api/'):
                 idx = DIST / 'index.html'
                 if idx.exists():
                     self.send_file(idx)
                     return
+                self.send_file(BASE / 'dashboard.html')
+                return
             self.send_error(404)
 
     def do_POST(self):
