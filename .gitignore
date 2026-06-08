@@ -28,3 +28,7 @@ data/pending_model_changes.json
 .DS_Store
 Thumbs.db
 data/sync_status.json.lock
+
+# Runtime data (generated at runtime)
+data/morning_brief_*.json
+data/*.lock

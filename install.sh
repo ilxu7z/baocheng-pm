@@ -185,7 +185,13 @@ print(' '.join(a['id'] for a in reg))
     # soft link data
     ws_data="$ws/data"
     if [ -L "$ws_data" ]; then
-      : # already a symlink
+      ws_old_target=$(readlink "$ws_data")
+      if [ "$ws_old_target" != "$REPO_DIR/data" ]; then
+        rm "$ws_data"
+        ln -s "$REPO_DIR/data" "$ws_data"
+        LINKED=$((LINKED + 1))
+        echo "    ↻ 更新: $ws -> $REPO_DIR/data"
+      fi
     elif [ -d "$ws_data" ]; then
       mv "$ws_data" "${ws_data}.bak.$(date +%Y%m%d-%H%M%S)"
       ln -s "$REPO_DIR/data" "$ws_data"
@@ -198,7 +204,13 @@ print(' '.join(a['id'] for a in reg))
     # soft link scripts
     ws_scripts="$ws/scripts"
     if [ -L "$ws_scripts" ]; then
-      :
+      ws_old_target=$(readlink "$ws_scripts")
+      if [ "$ws_old_target" != "$REPO_DIR/scripts" ]; then
+        rm "$ws_scripts"
+        ln -s "$REPO_DIR/scripts" "$ws_scripts"
+        LINKED=$((LINKED + 1))
+        echo "    ↻ 更新: $ws -> $REPO_DIR/scripts"
+      fi
     elif [ -d "$ws_scripts" ]; then
       mv "$ws_scripts" "${ws_scripts}.bak.$(date +%Y%m%d-%H%M%S)"
       ln -s "$REPO_DIR/scripts" "$ws_scripts"
@@ -279,7 +291,7 @@ print(' '.join(a['id'] for a in reg))
   for agent in "${AGENTS[@]}"; do
     AGENT_DIR="$OC_HOME/agents/$agent/agent"
     if [ -d "$AGENT_DIR" ] || mkdir -p "$AGENT_DIR" 2>/dev/null; then
-      cp "$MAIN_AUTH" "$AGENT_DIR/$AUTH_FILENAME"
+      cp -f "$MAIN_AUTH" "$AGENT_DIR/$AUTH_FILENAME" 2>/dev/null || true
       SYNCED=$((SYNCED + 1))
     fi
   done
