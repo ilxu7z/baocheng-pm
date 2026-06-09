@@ -1255,7 +1255,7 @@ function renderMonitor(tasks){
   courtCoverage.forEach(c => courtMap[c.id] = c);
 
   // 每个部门当前承接的旨意：从 JJC 任务里找 org 匹配且非 Done 的
-  const activeTasks = tasks.filter(t => isEdict(t) && t.state !== 'Done' && t.state !== 'Next');
+  const activeTasks = tasks.filter(t => isEdict(t) && t.state !== 'Done' && t.state !== 'Cancelled' && t.state !== 'Next');
   // 官员统计数据（如已加载）
   const offMap = {};
   if(officialsData && officialsData.officials){
