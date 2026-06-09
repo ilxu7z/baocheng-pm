@@ -214,15 +214,18 @@ def handle_task_action(task_id, action, reason):
         task['state'] = 'Blocked'
         task['block'] = reason or '皇上叫停'
         task['now'] = f'⏸️ 已暂停：{reason}'
+        task.setdefault('_scheduler', {})['enabled'] = False
     elif action == 'cancel':
         task['state'] = 'Cancelled'
         task['block'] = reason or '皇上取消'
         task['now'] = f'🚫 已取消：{reason}'
+        task.setdefault('_scheduler', {})['enabled'] = False
     elif action == 'resume':
         # Resume to previous active state or Doing
         task['state'] = task.get('_prev_state', 'Doing')
         task['block'] = '无'
         task['now'] = f'▶️ 已恢复执行'
+        task.setdefault('_scheduler', {})['enabled'] = True
 
     if action in ('stop', 'cancel'):
         task['_prev_state'] = old_state  # Save for resume
