@@ -55,6 +55,9 @@ MODEL_PRICING = {
     'google/gemini-2.0-flash':      {'in':0.075,'out':0.3, 'cr':0,    'cw':0},
     'google/gemini-2.5-pro':        {'in':1.25,'out':10.0, 'cr':0,    'cw':0},
     # RMB 定价（deepseek 缓存命中/未命中分开计费）
+    # 官方定价（元/百万tokens）：
+    #   v4-flash: 未命中输入1.0 / 缓存命中0.02 / 输出2.0
+    #   v4-pro:   未命中输入3.0 / 缓存命中0.025 / 输出6.0
     'deepseek/deepseek-v4-flash':   {'in':1.0, 'out':2.0, 'cr':0.02, 'cw':0, 'currency':'cny'},
     'deepseek/deepseek-v4-pro':     {'in':3.0, 'out':6.0, 'cr':0.025,'cw':0, 'currency':'cny'},
 }
@@ -167,13 +170,25 @@ def scan_agent(agent_id):
 def calc_cost(s, model):
     """计算成本，返回 (cost_cny, cost_usd)。
     DeepSeek 使用国内定价（缓存命中/未命中分开），直接返回人民币。
+
+    OpenClaw sessions.json 语义：
+      - tokens_in     = 未命中缓存的输入 tokens（实际发送给模型的部分）
+      - cache_read    = 从缓存命中的输入 tokens（独立计数，不包含在 tokens_in 中）
+      - tokens_out    = 输出 tokens
+      - cache_write   = 写入缓存的 tokens（通常不计费）
+    因此：
+      - 未命中输入费用 = tokens_in / 1M × 未命中单价
+      - 缓存命中费用   = cache_read / 1M × 缓存命中单价
+      - 输出费用        = tokens_out / 1M × 输出单价
     """
     p = MODEL_PRICING.get(model, MODEL_PRICING['anthropic/claude-sonnet-4-6'])
     if p.get('currency') == 'cny':
-        # DeepSeek: tokens_in 已经是 OpenClaw 归一化后的计费输入
-        # cache_read 是会话级累计，不适合拆分计费，按全量输入计
-        cny = (s['tokens_in']/1e6 * p['in'] + s['tokens_out']/1e6 * p['out'])
+        # DeepSeek: tokens_in 就是未命中输入，cache_read 是缓存命中输入
+        cny = (s['tokens_in']  / 1e6 * p['in']           # 未命中输入
+             + s['cache_read'] / 1e6 * p.get('cr', 0)    # 缓存命中输入
+             + s['tokens_out'] / 1e6 * p['out'])         # 输出
         return round(cny, 2), round(cny / 7.25, 4)
+    # USD 定价模型
     usd = (s['tokens_in']/1e6*p['in'] + s['tokens_out']/1e6*p['out']
          + s['cache_read']/1e6*p['cr'] + s['cache_write']/1e6*p['cw'])
     return round(usd * 7.25, 2), round(usd, 4)
@@ -264,7 +279,7 @@ def main():
             'tokens_out': ss['tokens_out'],
             'cache_read': ss['cache_read'],
             'cache_write': ss['cache_write'],
-            'tokens_total': ss['tokens_in'] + ss['tokens_out'],
+            'tokens_total': ss['tokens_in'] + ss['tokens_out'] + ss['cache_read'] + ss['cache_write'],
             'messages': ss['messages'],
             'cost_usd': cost_usd,
             'cost_cny': cost_cny,
