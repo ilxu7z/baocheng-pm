@@ -1120,24 +1120,40 @@ def wake_agent(agent_id, message=''):
     runtime_id = agent_id
     msg = message or f'🔔 系统心跳检测 — 请回复 OK 确认在线。当前时间: {now_iso()}'
 
+    # ⚡ 修复：taizi/main 是当前session的太子，不需要也不能通过子进程唤醒
+    if runtime_id == 'main':
+        log.info(f'ℹ️ 跳过 taizi/main 子进程唤醒（太子已在当前session运行中）')
+        return {'ok': True, 'message': f'{agent_id} 是当前太子，已在运行中，无需唤醒'}
+
     def do_wake():
         try:
-            cmd = ['openclaw', 'agent', '--agent', runtime_id, '-m', msg, '--timeout', '120']
-            log.info(f'🔔 唤醒 {agent_id}...')
-            # 带重试（最多2次）
-            for attempt in range(1, 3):
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=130)
-                if result.returncode == 0:
-                    log.info(f'✅ {agent_id} 已唤醒')
-                    return
-                err_msg = result.stderr[:200] if result.stderr else result.stdout[:200]
-                log.warning(f'⚠️ {agent_id} 唤醒失败(第{attempt}次): {err_msg}')
-                if attempt < 2:
-                    import time
-                    time.sleep(5)
-            log.error(f'❌ {agent_id} 唤醒最终失败')
-        except subprocess.TimeoutExpired:
-            log.error(f'❌ {agent_id} 唤醒超时(130s)')
+            cmd = ['openclaw', 'agent', '--agent', runtime_id, '-m', msg, '--timeout', '600']
+            log.info(f'🔔 唤醒 {agent_id}（异步投递）...')
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            # 等待1-3秒确认进程启动（不等待agent完成）
+            import time as _time
+            _started = False
+            for _i in range(3):
+                if proc.poll() is None:
+                    _started = True
+                    break
+                _time.sleep(1)
+            if _started:
+                log.info(f'✅ {agent_id} 唤醒已投递（agent处理中）')
+            elif proc.returncode == 0:
+                log.info(f'✅ {agent_id} 已唤醒（同步返回）')
+            else:
+                err = proc.stderr.read()[:200] if proc.stderr else '未知错误'
+                log.warning(f'⚠️ {agent_id} 唤醒失败: {err}')
+            # 清理僵尸进程
+            def _cleanup(p=proc, aid=agent_id):
+                p.wait(timeout=600)
+            threading.Thread(target=_cleanup, daemon=True).start()
         except Exception as e:
             log.warning(f'⚠️ {agent_id} 唤醒异常: {e}')
     threading.Thread(target=do_wake, daemon=True).start()
@@ -2464,33 +2480,76 @@ def dispatch_for_state(task_id, task, new_state, trigger='state-transition'):
                     _scheduler_add_flow(t, f'派发异常：OpenClaw CLI 未找到（{trigger}）', to=t.get('org', ''))
                 ))
                 return
-            cmd = [openclaw_bin, 'agent', '--agent', agent_id, '-m', msg, '--timeout', '300']
+            # ⚡ 修复：taizi/main 是当前session的太子，不需要也不能通过子进程唤醒
+            if agent_id == 'main':
+                log.info(f'ℹ️ {task_id} 跳过 taizi/main 子进程派发（太子已在当前session运行中）')
+                _update_task_scheduler(task_id, lambda t, s: (
+                    s.update({
+                        'lastDispatchAt': now_iso(),
+                        'lastDispatchStatus': 'skipped-main',
+                        'lastDispatchAgent': agent_id,
+                        'lastDispatchTrigger': trigger,
+                        'lastDispatchError': '',
+                    }),
+                    _scheduler_add_flow(t, f'跳过main派发（太子已在当前session）', to=t.get('org', ''))
+                ))
+                return
+
+            cmd = [openclaw_bin, 'agent', '--agent', agent_id, '-m', msg, '--timeout', '600']
             if _channel:
                 cmd.extend(['--deliver', '--channel', _channel])
-            max_retries = 2
-            err = ''
-            for attempt in range(1, max_retries + 1):
-                log.info(f'🔄 自动派发 {task_id} → {agent_id} (第{attempt}次)...')
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=310)
-                if result.returncode == 0:
-                    log.info(f'✅ {task_id} 自动派发成功 → {agent_id}')
-                    _update_task_scheduler(task_id, lambda t, s: (
-                        s.update({
-                            'lastDispatchAt': now_iso(),
-                            'lastDispatchStatus': 'success',
-                            'lastDispatchAgent': agent_id,
-                            'lastDispatchTrigger': trigger,
-                            'lastDispatchError': '',
-                        }),
-                        _scheduler_add_flow(t, f'派发成功：{agent_id}（{trigger}）', to=t.get('org', ''))
-                    ))
-                    return
-                err = result.stderr[:200] if result.stderr else result.stdout[:200]
-                log.warning(f'⚠️ {task_id} 自动派发失败(第{attempt}次): {err}')
-                if attempt < max_retries:
-                    import time
-                    time.sleep(5)
-            log.error(f'❌ {task_id} 自动派发最终失败 → {agent_id}')
+            log.info(f'🔄 自动派发 {task_id} → {agent_id} (异步投递)...')
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                # 异步投递模式：不等待agent完成，仅确认进程启动
+                # Agent收到消息后会在自己的session中工作
+                import time as _time
+                for _check in range(6):
+                    _ret = proc.poll()
+                    if _ret is not None:
+                        if _ret == 0:
+                            log.info(f'✅ {task_id} 自动派发完成（同步返回） → {agent_id}')
+                        else:
+                            log.warning(f'⚠️ {task_id} 派发进程提前退出 code={_ret}')
+                        break
+                    _time.sleep(1)
+                else:
+                    # 进程仍在运行 = agent正在处理 = 投递成功
+                    log.info(f'✅ {task_id} 自动派发已投递（agent处理中） → {agent_id}')
+
+                # 注册清理回调，避免僵尸进程
+                def _cleanup_proc(p=proc, tid=task_id, aid=agent_id, trig=trigger):
+                    p.wait(timeout=600)
+                    _rc = p.returncode
+                    if _rc == 0:
+                        log.info(f'✅ {tid} 派发进程正常结束 → {aid}')
+                    elif _rc is not None:
+                        log.warning(f'⚠️ {tid} 派发进程退出 code={_rc} → {aid}')
+                        _update_task_scheduler(tid, lambda t, s: s.update({
+                            'lastDispatchError': f'进程退出 code={_rc}',
+                        }))
+
+                threading.Thread(target=_cleanup_proc, daemon=True).start()
+
+                _update_task_scheduler(task_id, lambda t, s: (
+                    s.update({
+                        'lastDispatchAt': now_iso(),
+                        'lastDispatchStatus': 'dispatched',
+                        'lastDispatchAgent': agent_id,
+                        'lastDispatchTrigger': trigger,
+                        'lastDispatchError': '',
+                    }),
+                    _scheduler_add_flow(t, f'异步投递成功：{agent_id}（{trigger}）', to=t.get('org', ''))
+                ))
+                return
+            except Exception as _e:
+                err = str(_e)[:200]
+                log.error(f'❌ {task_id} 自动派发异常 → {agent_id}: {err}')
             _update_task_scheduler(task_id, lambda t, s: (
                 s.update({
                     'lastDispatchAt': now_iso(),
@@ -2871,7 +2930,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if p == '/api/scheduler-scan':
-            threshold_sec = body.get('thresholdSec', 180)
+            threshold_sec = body.get('thresholdSec', 600)
             try:
                 result = handle_scheduler_scan(threshold_sec)
                 self.send_json(result)
@@ -3192,19 +3251,20 @@ def main():
     threading.Timer(3.0, _startup_recover_queued_dispatches).start()
 
     # 定时巡检：每 120 秒自动扫描停滞任务并触发重试/升级/回滚
+    # 停滞阈值：600秒（10分钟）—— LLM Agent处理复杂任务需要5-10分钟
     def _periodic_scheduler_scan():
         while True:
             try:
                 import time as _time
                 _time.sleep(120)
-                result = handle_scheduler_scan(threshold_sec=180)
+                result = handle_scheduler_scan(threshold_sec=600)
                 count = result.get('count', 0) if isinstance(result, dict) else 0
                 if count > 0:
                     log.info(f'🔍 定时巡检：{count} 个动作')
             except Exception as e:
                 log.warning(f'定时巡检异常: {e}')
     threading.Thread(target=_periodic_scheduler_scan, daemon=True).start()
-    log.info('🔍 定时巡检已启动（每120秒）')
+    log.info('🔍 定时巡检已启动（每120秒，停滞阈值600秒）')
 
     try:
         server.serve_forever()
