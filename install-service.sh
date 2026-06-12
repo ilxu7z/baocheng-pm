@@ -6,7 +6,7 @@
 set -e
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PLIST_NAME="com.baocheng-pm.server"
+PLIST_NAME="com.oc-macs.server"
 PLIST_SRC="$REPO_DIR/$PLIST_NAME.plist"
 PLIST_DST="$HOME/Library/LaunchAgents/$PLIST_NAME.plist"
 

@@ -64,7 +64,7 @@ cron 触发 → 扫描所有项目 reviews/ 目录
 
 ## 运维职责
 
-- 保持看板服务器（baocheng-pm）稳定运行
+- 保持看板服务器（oc-macs）稳定运行
 - 监控 OpenClaw 服务状态
 - 处理部署相关问题
 

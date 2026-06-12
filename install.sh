@@ -107,7 +107,7 @@ cfg_path = oc_home / 'openclaw.json'
 cfg = json.loads(cfg_path.read_text())
 
 # 从 registry.json 加载 Agent 列表
-repo_dir = os.environ.get('EDICT_HOME', str(pathlib.Path(os.environ.get('HOME', str(pathlib.Path.home())) + '/Projects/baocheng-pm')))
+repo_dir = os.environ.get('EDICT_HOME', str(pathlib.Path(os.environ.get('HOME', str(pathlib.Path.home())) + '/Projects/oc-macs')))
 reg_path = pathlib.Path(repo_dir) / 'registry.json'
 if reg_path.exists():
     reg = json.loads(reg_path.read_text())

@@ -95,7 +95,7 @@ Layer 6: 归藏 → 最终版本中 FR→T 映射归档
 
 ## 工具链
 
-- **看板服务器**：`/Users/chee/Projects/baocheng-pm/`，启动：`./edict.sh start`
+- **看板服务器**：`/Users/chee/Projects/oc-macs/`，启动：`bash start.sh`
 - **创建任务**：`POST /api/tasks {title, ...}` 或看板 UI
 - **推进状态**：`python3 kanban_update.py task <task_id> state <new_state>`
 - **查看任务**：`python3 kanban_update.py task <task_id> get`

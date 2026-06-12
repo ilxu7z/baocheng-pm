@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.baocheng-pm.server</string>
+    <string>com.oc-macs.server</string>
 
     <key>ProgramArguments</key>
     <array>
