@@ -26,14 +26,17 @@ TOKEN_TTL = 24 * 60 * 60
 # auth.json 存储路径（由外部在 server.py 初始化时设置）
 _auth_file: pathlib.Path | None = None
 _secret_key: bytes | None = None
+_api_token: str | None = None
 
 
 def init(data_dir: pathlib.Path):
     """初始化认证模块。"""
-    global _auth_file, _secret_key
+    global _auth_file, _secret_key, _api_token
     _auth_file = data_dir / 'auth.json'
     # 每次启动生成新的签名密钥（重启后旧 token 失效，这是安全特性）
     _secret_key = secrets.token_bytes(32)
+    # API Token 由环境变量 EDICT_API_TOKEN 注入，重启不变
+    _api_token = os.environ.get('EDICT_API_TOKEN') or None
 
 
 def is_configured() -> bool:
@@ -142,6 +145,16 @@ def extract_token(headers) -> str | None:
         if part.startswith('edict_token='):
             return part[len('edict_token='):]
     return None
+
+
+def verify_api_token(token: str) -> bool:
+    """验证 API Token（环境变量 EDICT_API_TOKEN 配置，重启不变）。
+    
+    API Token 用于 Agent 自动化调用，不依赖密码登录。
+    """
+    if not _api_token:
+        return False
+    return hmac.compare_digest(token, _api_token)
 
 
 # 不需要认证的路径白名单

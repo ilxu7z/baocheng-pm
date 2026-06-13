@@ -27,8 +27,12 @@ data/pending_model_changes.json
 # OS
 .DS_Store
 Thumbs.db
+
+# Environment
+.env
 data/sync_status.json.lock
 
 # Runtime data (generated at runtime)
 data/morning_brief_*.json
 data/*.lock
+data/morning_brief.json

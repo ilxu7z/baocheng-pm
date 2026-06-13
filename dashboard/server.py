@@ -17,7 +17,7 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 # JWT 认证模块
-from auth import init as auth_init, requires_auth, extract_token, verify_token, \
+from auth import init as auth_init, requires_auth, extract_token, verify_token, verify_api_token, \
     is_enabled as auth_enabled, is_configured as auth_configured, \
     setup_password, verify_password, create_token
 
@@ -2701,10 +2701,20 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     def _check_auth(self):
-        """检查认证，未通过返回 True（已发送 401 响应）。"""
+        """检查认证，未通过返回 True（已发送 401 响应）。
+        
+        认证优先级：
+        1. X-API-Token 头（Agent 自动化调用，重启不变）
+        2. Authorization: Bearer 或 Cookie（用户登录 session）
+        """
         p = urlparse(self.path).path.rstrip('/')
         if not requires_auth(p):
             return False
+        # 优先检查 API Token（Agent 自动化调用）
+        api_token = self.headers.get('X-API-Token', '')
+        if api_token and verify_api_token(api_token):
+            return False
+        # 其次检查用户登录 token
         token = extract_token(self.headers)
         if not token or not verify_token(token):
             self.send_json({'ok': False, 'error': '未登录或会话已过期'}, 401)

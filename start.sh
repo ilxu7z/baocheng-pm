@@ -105,6 +105,12 @@ LOOP_PID=$!
 
 # 启动看板服务器
 echo -e "${GREEN}▶ 启动看板服务器 (port 7891)...${NC}"
+# 传递 API Token 环境变量（Agent 自动化调用用）
+if [ -n "$EDICT_API_TOKEN" ]; then
+  export EDICT_API_TOKEN
+elif [ -f "$REPO_DIR/.env" ]; then
+  source <(grep -E '^EDICT_API_TOKEN=' "$REPO_DIR/.env" 2>/dev/null)
+fi
 "$PYTHON_BIN" dashboard/server.py &
 SERVER_PID=$!
 

@@ -103,6 +103,12 @@ do_start() {
   # 启动看板服务器（后台）
   if ! _is_running "$SERVER_PIDFILE"; then
     echo -e "${GREEN}▶ 启动看板服务器...${NC}"
+    # 传递 API Token 环境变量（Agent 自动化调用用）
+    if [ -n "$EDICT_API_TOKEN" ]; then
+      export EDICT_API_TOKEN
+    elif [ -f "$REPO_DIR/.env" ]; then
+      source <(grep -E '^EDICT_API_TOKEN=' "$REPO_DIR/.env" 2>/dev/null)
+    fi
     nohup python3 "$REPO_DIR/dashboard/server.py" \
       --host "$DASHBOARD_HOST" --port "$DASHBOARD_PORT" \
       >> "$SERVER_LOG" 2>&1 &
