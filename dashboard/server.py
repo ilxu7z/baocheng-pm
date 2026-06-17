@@ -2480,19 +2480,41 @@ def dispatch_for_state(task_id, task, new_state, trigger='state-transition'):
                     _scheduler_add_flow(t, f'派发异常：OpenClaw CLI 未找到（{trigger}）', to=t.get('org', ''))
                 ))
                 return
-            # ⚡ 修复：taizi/main 是当前session的太子，不需要也不能通过子进程唤醒
+            # ⚡ 太子（main）已在当前session运行中，直接在当前会话通知
             if agent_id == 'main':
-                log.info(f'ℹ️ {task_id} 跳过 taizi/main 子进程派发（太子已在当前session运行中）')
+                log.info(f'ℹ️ {task_id} 太子已在当前session，直接发送通知消息')
                 _update_task_scheduler(task_id, lambda t, s: (
                     s.update({
                         'lastDispatchAt': now_iso(),
-                        'lastDispatchStatus': 'skipped-main',
+                        'lastDispatchStatus': 'notify-main',
                         'lastDispatchAgent': agent_id,
                         'lastDispatchTrigger': trigger,
                         'lastDispatchError': '',
                     }),
-                    _scheduler_add_flow(t, f'跳过main派发（太子已在当前session）', to=t.get('org', ''))
+                    _scheduler_add_flow(t, f'通知太子（当前session）', to=t.get('org', ''))
                 ))
+                # 不跳过，直接发送消息到 main session（通过 --deliver 回当前对话）
+                cmd = [openclaw_bin, 'agent', '--agent', 'main', '-m', msg, '--deliver', '--timeout', '600']
+                log.info(f'🔄 通知太子 {task_id}（当前session投递）...')
+                try:
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                    import time as _time
+                    for _check in range(6):
+                        _ret = proc.poll()
+                        if _ret is not None:
+                            if _ret == 0:
+                                log.info(f'✅ {task_id} 太子通知完成')
+                            else:
+                                log.warning(f'⚠️ {task_id} 太子通知进程提前退出 code={_ret}')
+                            break
+                        _time.sleep(1)
+                except Exception as e:
+                    log.warning(f'⚠️ {task_id} 太子通知异常: {e}')
                 return
 
             cmd = [openclaw_bin, 'agent', '--agent', agent_id, '-m', msg, '--timeout', '600']
