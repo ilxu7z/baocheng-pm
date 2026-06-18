@@ -12,7 +12,7 @@ Endpoints:
   GET  /api/last-result        → data/last_model_change_result.json
 """
 import json, pathlib, subprocess, sys, threading, argparse, datetime, logging, re, os, socket, shutil
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
@@ -40,6 +40,30 @@ CHANNELS_DIR = pathlib.Path(__file__).parent.parent / 'edict' / 'backend' / 'app
 if str(CHANNELS_DIR.parent) not in sys.path:
     sys.path.insert(0, str(CHANNELS_DIR.parent))
 from channels import get_channel, get_channel_info, CHANNELS as NOTIFICATION_CHANNELS
+
+# ── 内存缓存（减少磁盘 I/O）──
+_CACHE = {}
+_CACHE_TTL = 2.0  # 秒
+
+def _cache_get(key):
+    """获取缓存，过期返回 None"""
+    entry = _CACHE.get(key)
+    if entry and (datetime.datetime.now() - entry['ts']).total_seconds() < _CACHE_TTL:
+        return entry['value']
+    return None
+
+def _cache_set(key, value):
+    _CACHE[key] = {'value': value, 'ts': datetime.datetime.now()}
+
+def _cache_read_json(path, default=None):
+    """带缓存的 JSON 读取"""
+    key = str(path)
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+    value = read_json(path, default)
+    _cache_set(key, value)
+    return value
 
 OCLAW_HOME = pathlib.Path.home() / '.openclaw'
 MAX_REQUEST_BODY = 1 * 1024 * 1024  # 1 MB
@@ -845,7 +869,7 @@ def _check_gateway_alive():
                 return True
             return False
         result = subprocess.run(['pgrep', '-f', 'openclaw-gateway'],
-                                capture_output=True, text=True, timeout=5)
+                                 capture_output=True, text=True, timeout=5)
         return result.returncode == 0
     except Exception:
         return False
@@ -2765,17 +2789,17 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({'status': 'ok' if all_ok else 'degraded', 'ts': now_iso(), 'checks': checks})
         elif p == '/api/live-status':
             task_data_dir = get_task_data_dir()
-            self.send_json(read_json(task_data_dir / 'live_status.json'))
+            self.send_json(_cache_read_json(task_data_dir / 'live_status.json'))
         elif p == '/api/agent-config':
-            self.send_json(read_json(DATA / 'agent_config.json'))
+            self.send_json(_cache_read_json(DATA / 'agent_config.json'))
         elif p == '/api/model-change-log':
-            self.send_json(read_json(DATA / 'model_change_log.json', []))
+            self.send_json(_cache_read_json(DATA / 'model_change_log.json', []))
         elif p == '/api/last-result':
-            self.send_json(read_json(DATA / 'last_model_change_result.json', {}))
+            self.send_json(_cache_read_json(DATA / 'last_model_change_result.json', {}))
         elif p == '/api/officials-stats':
-            self.send_json(read_json(DATA / 'officials_stats.json', {}))
+            self.send_json(_cache_read_json(DATA / 'officials_stats.json', {}))
         elif p == '/api/morning-brief':
-            self.send_json(read_json(DATA / 'morning_brief.json', {}))
+            self.send_json(_cache_read_json(DATA / 'morning_brief.json', {}))
         elif p == '/api/morning-config':
             migrate_notification_config()
             self.send_json(read_json(DATA / 'morning_brief_config.json', {
@@ -3267,7 +3291,7 @@ def main():
         f'http://127.0.0.1:{args.port}', f'http://localhost:{args.port}',
     }
 
-    server = HTTPServer((args.host, args.port), Handler)
+    server = ThreadingHTTPServer((args.host, args.port), Handler)
     log.info(f'三省六部看板启动 → http://{args.host}:{args.port}')
     print(f'   按 Ctrl+C 停止')
 
