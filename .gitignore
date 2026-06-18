@@ -36,3 +36,11 @@ data/sync_status.json.lock
 data/morning_brief_*.json
 data/*.lock
 data/morning_brief.json
+data/.refresh_pending
+data/agent_memory/
+data/audit_log.json
+data/output/
+data/shared_memory.json
+data/task_memory/
+plans/
+scripts/memos-embed-repair.js
