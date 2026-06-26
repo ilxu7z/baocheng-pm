@@ -1298,7 +1298,10 @@ def _ensure_scheduler(task):
     if not isinstance(sched, dict):
         sched = {}
         task['_scheduler'] = sched
-    sched.setdefault('enabled', True)
+    # JJC-AUTO 任务是 Agent 会话的被动镜像，默认不启用调度器
+    task_id = task.get('id', '')
+    auto_task = str(task_id).startswith('JJC-AUTO')
+    sched.setdefault('enabled', not auto_task)
     sched.setdefault('stallThresholdSec', 600)
     sched.setdefault('maxRetry', 2)
     sched.setdefault('retryCount', 0)
@@ -1533,6 +1536,10 @@ def handle_scheduler_scan(threshold_sec=600):
             if not task_id or state in _TERMINAL_STATES or task.get('archived'):
                 continue
             if state == 'Blocked':
+                continue
+            # JJC-AUTO 任务是 Agent 会话的被动镜像，不应被调度器派发
+            # 它们只是告诉看板「这个 Agent 刚才在活跃」，不是待办工作
+            if str(task_id).startswith('JJC-AUTO'):
                 continue
 
             sched = _ensure_scheduler(task)
