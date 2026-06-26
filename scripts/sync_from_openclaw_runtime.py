@@ -190,6 +190,13 @@ def load_activity(session_file, limit=12):
     return rows
 
 
+def _session_file_exists(task):
+    """检查 AUTO 任务对应的 session .jsonl 文件是否存在"""
+    # output 字段在 build_task 中已设置为 sessionFile 路径
+    session_file = task.get('output', '')
+    return bool(session_file and pathlib.Path(session_file).exists())
+
+
 def build_task(agent_id, session_key, row, now_ms):
     # ── 字段提取（全部 safe_get，向前兼容变更）──
     session_id = row.get('sessionId') or row.get('id') or session_key
@@ -213,6 +220,12 @@ def build_task(agent_id, session_key, row, now_ms):
     # sessionFile: 5.28+ transcript 路径可能重写，加存在性校验
     session_file = row.get('sessionFile') or row.get('transcriptPath') or ''
     session_file_exists = bool(session_file and pathlib.Path(session_file).exists())
+
+    # 跳过僵尸会话：sessions.json 有记录但 .jsonl 文件已不存在
+    # Gateway 可能在内存中保留了会话引用并持续刷新 updatedAt，
+    # 但实际对话文件已删除/移动，这类条目不应出现在看板上
+    if not session_file_exists:
+        return None
 
     # ── Activity 提取 ──
     latest_act = '等待指令'
@@ -239,6 +252,9 @@ def build_task(agent_id, session_key, row, now_ms):
 
     # ── 标题推断 ──
     import re
+    # 跳过非工作会话：heartbeat、dashboard、gateway-fallback 等内部会话
+    if re.search(r':heartbeat', session_key) or re.search(r':dashboard:', session_key) or 'gateway-fallback' in session_key:
+        return None
     if re.match(r'agent:\w+:cron:', title_label):
         title = f"{org}定时任务"
     elif re.match(r'agent:\w+:subagent:', title_label):
@@ -318,7 +334,9 @@ def main():
                     if not session_key:
                         continue
                     try:
-                        tasks.append(build_task(agent_id, session_key, row, now_ms))
+                        result = build_task(agent_id, session_key, row, now_ms)
+                        if result is not None:
+                            tasks.append(result)
                     except Exception as be:
                         log.warning(f'build_task failed for {agent_id}/{session_key}: {be}')
 
@@ -396,6 +414,8 @@ def main():
                 # 去掉 tasks 里人工下旨的 JJC 任务（以防重复），但保留 JJC-AUTO 自动发现任务
                 # dashboard 旨意看板只显示 /^JJC-/i 的任务，故自动发现也以 JJC-AUTO 前缀
                 tasks = [t for t in tasks if not (str(t.get('id', '')).startswith('JJC') and not str(t.get('id', '')).startswith('JJC-AUTO'))]
+                # 过滤掉已不存在的 AUTO 任务（session .jsonl 文件已删除但 sessions.json 还有僵尸条目）
+                jjc_existing = [t for t in jjc_existing if not (str(t.get('id', '')).startswith('JJC-AUTO') and not _session_file_exists(t))]
                 tasks = jjc_existing + tasks
                 # 再次去重（jjc_existing 和 tasks 中可能有相同 id 的 JJC-AUTO 任务）
                 seen = set()
