@@ -304,6 +304,9 @@
     .archive-bar .ab-scan-detail.active{border-color:var(--acc);color:var(--acc);background:#0f1a38}
     .archive-bar .ab-scan-copy{font-size:11px;padding:4px 10px;border-radius:6px;border:1px solid #2ecc8a44;background:transparent;cursor:pointer;color:var(--ok);font-weight:600;transition:all .15s}
     .archive-bar .ab-scan-copy:hover{background:#0a2018;border-color:var(--ok)}
+    .archive-bar .ab-unstuck{font-size:11px;padding:4px 12px;border-radius:6px;border:1px solid #f0b42944;background:transparent;cursor:pointer;color:#f0b429;font-weight:600;transition:all .15s}
+    .archive-bar .ab-unstuck:hover{background:#1a1408;border-color:#f0b429}
+    .archive-bar .ab-unstuck:disabled{opacity:0.5;cursor:not-allowed}
     .global-scan-detail{display:none;margin-top:-4px;margin-bottom:12px;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
     .global-scan-detail.open{display:block}
     .global-scan-detail .gs-empty{font-size:11px;color:var(--muted)}
@@ -714,6 +717,7 @@
       <button class="ab-btn" data-filter="all" onclick="setEdictFilter('all')">全部</button>
       <span class="ab-count" id="archive-count"></span>
       <button class="ab-scan" id="btn-global-scan" onclick="runGlobalSchedulerScan()">🧭 太子巡检</button>
+      <button class="ab-unstuck" id="btn-smart-unstuck" onclick="runSmartUnstuck()">🪄 智能解卡</button>
       <span class="ab-scan-status" id="global-scan-status">未巡检</span>
       <button class="ab-scan-detail" id="btn-global-scan-detail" onclick="toggleGlobalScanDetails()" style="display:none">查看巡检详情</button>
       <button class="ab-scan-copy" id="btn-global-scan-copy" onclick="copyGlobalScanReport()" style="display:none">📋 复制巡检报告</button>
@@ -2888,6 +2892,35 @@ async function copyGlobalScanReport(){
     try{ document.execCommand('copy'); toast('📋 巡检报告已复制','ok'); }
     catch(__){ toast('复制失败，请手动复制','err'); }
     ta.remove();
+  }
+}
+
+async function runSmartUnstuck(){
+  const btn = document.getElementById('btn-smart-unstuck');
+  if(!btn) return;
+  const oldText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '⟳ 解卡中...';
+  try{
+    const r = await postJ(API + '/smart-unstuck', {thresholdHours: 12});
+    if(r.ok){
+      const cancelled = r.cancelled || 0;
+      const retried = r.retried || 0;
+      const total = r.count || 0;
+      let msg = `🪄 智能解卡完成：`;
+      if(cancelled > 0) msg += `${cancelled} 个超时清理`;
+      if(retried > 0) msg += `${retried} 个强制续推`;
+      if(total === 0) msg += '无需处理';
+      toast(msg, 'ok');
+      loadAll();
+    }else{
+      toast(r.error || '解卡失败', 'err');
+    }
+  }catch(e){
+    toast('服务器连接失败', 'err');
+  }finally{
+    btn.disabled = false;
+    btn.textContent = oldText;
   }
 }
 

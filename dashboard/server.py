@@ -1697,6 +1697,85 @@ def handle_scheduler_scan(threshold_sec=600):
     }
 
 
+def handle_smart_unstuck(threshold_hours=12):
+    """智能解卡：一键清理超时任务或强制续推。
+    
+    规则：
+    - 停滞 > threshold_hours 小时 → 自动取消（清理）
+    - 停滞 ≤ threshold_hours 小时 → 重置调度器 + 强制派发（续推）
+    
+    只处理非终态、非归档的人工 JJC 任务。
+    """
+    threshold_sec = max(1, int(threshold_hours or 12)) * 3600
+    now_dt = datetime.datetime.now(datetime.timezone.utc)
+    actions = []
+    pending_dispatches = []
+
+    def _unstuck(tasks):
+        for task in tasks:
+            task_id = task.get('id', '')
+            state = task.get('state', '')
+            if not task_id or state in _TERMINAL_STATES or task.get('archived'):
+                continue
+            if state == 'Blocked':
+                continue
+            # 只处理人工 JJC 任务，跳过 AUTO
+            if str(task_id).startswith('JJC-AUTO'):
+                continue
+
+            sched = _ensure_scheduler(task)
+            last_progress = _parse_iso(sched.get('lastProgressAt') or task.get('updatedAt'))
+            if not last_progress:
+                continue
+            stalled_sec = max(0, int((now_dt - last_progress).total_seconds()))
+
+            if stalled_sec > threshold_sec:
+                # 超时 → 清理
+                old_state = task.get('state', '?')
+                task['state'] = 'Cancelled'
+                task['block'] = f'停滞 {stalled_sec // 3600}h，自动清理'
+                task['now'] = f'🚫 已停滞 {stalled_sec // 3600}h，智能解卡自动取消'
+                sched['enabled'] = False
+                _scheduler_add_flow(task, f'智能解卡：停滞{stalled_sec // 3600}h → 自动取消（原状态: {old_state}）')
+                task['updatedAt'] = now_iso()
+                actions.append({'taskId': task_id, 'action': 'cancel', 'stalledHours': stalled_sec // 3600, 'oldState': old_state})
+            else:
+                # 未超时 → 重置调度器 + 强制续推
+                sched['retryCount'] = 0
+                sched['escalationLevel'] = 0
+                sched['rollbackCount'] = 0
+                sched['stallSince'] = None
+                sched['lastProgressAt'] = now_iso()
+                sched['enabled'] = True
+                task['block'] = '无'
+                task['now'] = '🔄 智能解卡：重置调度器，强制续推'
+                _scheduler_add_flow(task, f'智能解卡：重置调度器（停滞{stalled_sec}s），强制续推')
+                task['updatedAt'] = now_iso()
+                pending_dispatches.append((task_id, state))
+                actions.append({'taskId': task_id, 'action': 'force-retry', 'stalledSec': stalled_sec})
+
+        return tasks
+
+    modify_tasks(_unstuck)
+
+    # 锁外派发
+    tasks = load_tasks()
+    for task_id, state in pending_dispatches:
+        task = next((t for t in tasks if t.get('id') == task_id), None)
+        if task and state not in _TERMINAL_STATES:
+            dispatch_for_state(task_id, task, state, trigger='smart-unstuck')
+
+    return {
+        'ok': True,
+        'thresholdHours': threshold_hours,
+        'actions': actions,
+        'count': len(actions),
+        'cancelled': sum(1 for a in actions if a['action'] == 'cancel'),
+        'retried': sum(1 for a in actions if a['action'] == 'force-retry'),
+        'checkedAt': now_iso(),
+    }
+
+
 def _startup_recover_queued_dispatches():
     """服务启动后扫描 lastDispatchStatus=queued 的任务，重新派发。
     解决：kill -9 重启导致派发线程中断、任务永久卡住的问题。"""
@@ -3147,6 +3226,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(result)
             except Exception as e:
                 self.send_json({'ok': False, 'error': f'scheduler scan failed: {e}'}, 500)
+            return
+
+        if p == '/api/smart-unstuck':
+            threshold_hours = body.get('thresholdHours', 12)
+            try:
+                result = handle_smart_unstuck(threshold_hours)
+                self.send_json(result)
+            except Exception as e:
+                self.send_json({'ok': False, 'error': f'smart unstuck failed: {e}'}, 500)
             return
 
         if p == '/api/repair-flow-order':
