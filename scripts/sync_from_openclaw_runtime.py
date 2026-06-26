@@ -252,8 +252,11 @@ def build_task(agent_id, session_key, row, now_ms):
 
     # ── 标题推断 ──
     import re
-    # 跳过非工作会话：heartbeat、dashboard、gateway-fallback 等内部会话
+    # 跳过非工作会话：heartbeat、dashboard、gateway-fallback、main 等内部会话
+    # agent:*:main 是 Agent 自身的主聊天会话，不是工作任务
     if re.search(r':heartbeat', session_key) or re.search(r':dashboard:', session_key) or 'gateway-fallback' in session_key:
+        return None
+    if re.match(r'agent:\w+:main$', session_key):
         return None
     if re.match(r'agent:\w+:cron:', title_label):
         title = f"{org}定时任务"
