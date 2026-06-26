@@ -35,22 +35,8 @@ ID_LABEL = {
     'rongcui':  {'label': '溶萃',   'role': '全能工程师', 'duty': '运维部署、技术支持、特殊任务',    'emoji': '🔧'},
 }
 
-KNOWN_MODELS = [
-    {'id': 'anthropic/claude-sonnet-4-6', 'label': 'Claude Sonnet 4.6', 'provider': 'Anthropic'},
-    {'id': 'anthropic/claude-opus-4-5',   'label': 'Claude Opus 4.5',   'provider': 'Anthropic'},
-    {'id': 'anthropic/claude-haiku-3-5',  'label': 'Claude Haiku 3.5',  'provider': 'Anthropic'},
-    {'id': 'openai/gpt-4o',               'label': 'GPT-4o',            'provider': 'OpenAI'},
-    {'id': 'openai/gpt-4o-mini',          'label': 'GPT-4o Mini',       'provider': 'OpenAI'},
-    {'id': 'openai-codex/gpt-5.3-codex',  'label': 'GPT-5.3 Codex',    'provider': 'OpenAI Codex'},
-    {'id': 'google/gemini-2.0-flash',     'label': 'Gemini 2.0 Flash',  'provider': 'Google'},
-    {'id': 'google/gemini-2.5-pro',       'label': 'Gemini 2.5 Pro',    'provider': 'Google'},
-    {'id': 'copilot/claude-sonnet-4',     'label': 'Claude Sonnet 4',   'provider': 'Copilot'},
-    {'id': 'copilot/claude-opus-4.5',     'label': 'Claude Opus 4.5',   'provider': 'Copilot'},
-    {'id': 'github-copilot/claude-opus-4.6', 'label': 'Claude Opus 4.6', 'provider': 'GitHub Copilot'},
-    {'id': 'copilot/gpt-4o',              'label': 'GPT-4o',            'provider': 'Copilot'},
-    {'id': 'copilot/gemini-2.5-pro',      'label': 'Gemini 2.5 Pro',    'provider': 'Copilot'},
-    {'id': 'copilot/o3-mini',             'label': 'o3-mini',           'provider': 'Copilot'},
-]
+# 不再维护硬编码模型列表。所有可用模型从 openclaw.json 的 defaults.models 读取，
+# 这是 OpenClaw 实际使用的模型列表，是唯一真相源。
 
 
 def normalize_model(model_value, fallback='unknown'):
@@ -181,43 +167,51 @@ def _merge_skills(global_skills, agent_specific_skills, agent_id):
 
 
 def _collect_openclaw_models(cfg):
-    """从 openclaw.json 中收集所有已配置的 model id，与 KNOWN_MODELS 合并去重。
-    解决 #127: 自定义 provider 的 model 不在下拉列表中。
+    """从 openclaw.json 的 defaults.models 收集所有可用模型。
+    
+    defaults.models 是 OpenClaw 实际使用的模型列表，是唯一真相源。
+    格式: {"ProviderName/model-id": {}, ...}
+    
+    同时兜底收集 agents.list 中各 agent 的 model 字段，确保已分配给 agent
+    的模型即使不在 defaults.models 中也能出现在下拉列表。
     """
-    known_ids = {m['id'] for m in KNOWN_MODELS}
-    extra = []
+    result = []
+    seen_ids = set()
+
     agents_cfg = cfg.get('agents', {})
-    # 收集 defaults.model
-    dm = normalize_model(agents_cfg.get('defaults', {}).get('model', {}), '')
-    if dm and dm not in known_ids:
-        extra.append({'id': dm, 'label': dm, 'provider': 'OpenClaw'})
-        known_ids.add(dm)
-    # 收集 defaults.models 中的所有模型（OpenClaw 默认启用的模型列表）
+
+    # 主源：defaults.models（OpenClaw 实际启用的模型）
     defaults_models = agents_cfg.get('defaults', {}).get('models', {})
     if isinstance(defaults_models, dict):
-        for model_id in defaults_models.keys():
-            if model_id and model_id not in known_ids:
-                provider = 'OpenClaw'
-                if '/' in model_id:
-                    provider = model_id.split('/')[0]
-                extra.append({'id': model_id, 'label': model_id, 'provider': provider})
-                known_ids.add(model_id)
-    # 收集每个 agent 的 model
+        for full_id in defaults_models.keys():
+            if not full_id or full_id in seen_ids:
+                continue
+            seen_ids.add(full_id)
+            # full_id 格式: "ProviderName/model-id" 如 "火山/deepseek-v4-flash-260425"
+            parts = full_id.split('/', 1)
+            provider = parts[0] if len(parts) > 1 else 'OpenClaw'
+            model_name = parts[1] if len(parts) > 1 else full_id
+            result.append({
+                'id': full_id,
+                'label': model_name,
+                'provider': provider,
+            })
+
+    # 兜底：agents.list 中各 agent 的 model（可能不在 defaults.models 中）
     for ag in agents_cfg.get('list', []):
         m = normalize_model(ag.get('model', ''), '')
-        if m and m not in known_ids:
-            extra.append({'id': m, 'label': m, 'provider': 'OpenClaw'})
-            known_ids.add(m)
-    # 收集 providers 中的 model id（如 copilot-proxy、anthropic 等）
-    # 5.28+ 兼容：cfg.models.providers（正确路径），兜底 cfg.providers（旧版兼容）
-    providers_cfg = cfg.get('models', {}).get('providers', {}) or cfg.get('providers', {})
-    for pname, pcfg in providers_cfg.items():
-        for mid in (pcfg.get('models') or []):
-            mid_str = mid if isinstance(mid, str) else (mid.get('id') or mid.get('name') or '')
-            if mid_str and mid_str not in known_ids:
-                extra.append({'id': mid_str, 'label': mid_str, 'provider': pname})
-                known_ids.add(mid_str)
-    return KNOWN_MODELS + extra
+        if m and m not in seen_ids:
+            seen_ids.add(m)
+            parts = m.split('/', 1)
+            provider = parts[0] if len(parts) > 1 else 'OpenClaw'
+            model_name = parts[1] if len(parts) > 1 else m
+            result.append({
+                'id': m,
+                'label': model_name,
+                'provider': provider,
+            })
+
+    return result
 
 
 def main():

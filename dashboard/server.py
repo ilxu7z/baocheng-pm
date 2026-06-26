@@ -5,8 +5,11 @@ Port: 7891 (可通过 --port 修改)
 
 Endpoints:
   GET  /                       → dashboard.html
+  GET  /provider-keys          → provider-keys.html (API Key 管理)
   GET  /api/live-status        → data/live_status.json
   GET  /api/agent-config       → data/agent_config.json
+  GET  /api/provider-keys      → 列出所有 Provider 及脱敏密钥（模型从 defaults.models 读取）
+  POST /api/provider-key       → 更新 Provider API Key
   POST /api/set-model          → {agentId, model}
   GET  /api/model-change-log   → data/model_change_log.json
   GET  /api/last-result        → data/last_model_change_result.json
@@ -25,7 +28,7 @@ from auth import init as auth_init, requires_auth, extract_token, verify_token, 
 scripts_dir = str(pathlib.Path(__file__).parent.parent / 'scripts')
 sys.path.insert(0, scripts_dir)
 from file_lock import atomic_json_read, atomic_json_write, atomic_json_update
-from utils import validate_url, read_json, now_iso, python_bin
+from utils import validate_url, read_json, now_iso, python_bin, get_openclaw_home
 from court_discuss import (
     create_session as cd_create, advance_discussion as cd_advance,
     get_session as cd_get, conclude_session as cd_conclude,
@@ -40,6 +43,12 @@ CHANNELS_DIR = pathlib.Path(__file__).parent.parent / 'edict' / 'backend' / 'app
 if str(CHANNELS_DIR.parent) not in sys.path:
     sys.path.insert(0, str(CHANNELS_DIR.parent))
 from channels import get_channel, get_channel_info, CHANNELS as NOTIFICATION_CHANNELS
+
+# ── 派发超时配置 ──
+# openclaw agent 正常应在 30s 内完成，但复杂任务可能需要更久
+# 120s 足够覆盖绝大多数场景，同时避免僵尸进程无限挂起
+DISPATCH_AGENT_TIMEOUT = 120  # 秒
+DISPATCH_CLEANUP_TIMEOUT = 180  # 清理线程超时（比 agent 超时多 60s 缓冲）
 
 # ── 内存缓存（减少磁盘 I/O）──
 _CACHE = {}
@@ -77,6 +86,7 @@ _DEFAULT_ORIGINS = {
 _SAFE_NAME_RE = re.compile(r'^[a-zA-Z0-9_\-\u4e00-\u9fff]+$')
 
 BASE = pathlib.Path(__file__).parent
+OPENCLAW_HOME = get_openclaw_home()
 DIST = BASE / 'dist'          # React 构建产物 (npm run build)
 DATA = BASE.parent / "data"
 SCRIPTS = BASE.parent / 'scripts'
@@ -276,7 +286,11 @@ def handle_task_action(task_id, action, reason):
 
 
 def handle_archive_task(task_id, archived, archive_all_done=False):
-    """Archive or unarchive a task, or batch-archive all Done/Cancelled tasks."""
+    """Archive or unarchive a task, or batch-archive all Done/Cancelled tasks.
+    
+    归档非终态任务时，自动将其标记为 Cancelled，避免出现
+    「已归档但状态仍是 Doing/Taizi」的混乱状态。
+    """
     tasks = load_tasks()
     if archive_all_done:
         count = 0
@@ -293,6 +307,12 @@ def handle_archive_task(task_id, archived, archive_all_done=False):
     task['archived'] = archived
     if archived:
         task['archivedAt'] = now_iso()
+        # 归档非终态任务时，自动标记为 Cancelled
+        if task.get('state') not in ('Done', 'Cancelled'):
+            old_state = task.get('state', '?')
+            task['state'] = 'Cancelled'
+            task['now'] = f'归档时自动取消（原状态: {old_state}）'
+            _scheduler_add_flow(task, f'归档 → 自动取消（原状态: {old_state}）')
     else:
         task.pop('archivedAt', None)
     task['updatedAt'] = now_iso()
@@ -517,6 +537,58 @@ def add_remote_skill(agent_id, skill_name, source_url, description=''):
         'size': len(content),
         'addedAt': now_iso(),
     }
+
+
+def get_provider_keys():
+    """列出所有 Provider 及其 API Key（脱敏），模型从 defaults.models 读取。
+    
+    defaults.models 是 OpenClaw 实际使用的模型列表，是唯一真相源。
+    providers.models 作为补充参考。
+    """
+    cfg = read_json(OPENCLAW_HOME / 'openclaw.json', {})
+    providers = cfg.get('models', {}).get('providers', {})
+    
+    # 从 defaults.models 收集每个 provider 的模型
+    defaults_models = cfg.get('agents', {}).get('defaults', {}).get('models', {})
+    provider_models = {}  # provider_name → [model_ids]
+    if isinstance(defaults_models, dict):
+        for full_id in defaults_models.keys():
+            if not full_id:
+                continue
+            parts = full_id.split('/', 1)
+            if len(parts) != 2:
+                continue
+            pname, model_id = parts
+            # 大小写不敏感匹配 provider
+            matched = None
+            for pn in providers:
+                if pn.lower() == pname.lower():
+                    matched = pn
+                    break
+            if matched:
+                if matched not in provider_models:
+                    provider_models[matched] = []
+                provider_models[matched].append(model_id)
+    
+    result = []
+    for name, pcfg in providers.items():
+        key = pcfg.get('apiKey', '')
+        masked = ''
+        if key:
+            masked = key[:8] + '…' + key[-4:] if len(key) > 12 else '***'
+        # 合并：defaults.models 中的模型 + providers.models 中的模型
+        active_models = provider_models.get(name, [])
+        configured_models = [m.get('id', '') if isinstance(m, dict) else m for m in pcfg.get('models', [])]
+        result.append({
+            'name': name,
+            'baseUrl': pcfg.get('baseUrl', ''),
+            'api': pcfg.get('api', ''),
+            'apiKeyMasked': masked,
+            'hasKey': bool(key),
+            'activeModels': active_models,       # defaults.models 中实际启用的
+            'configuredModels': configured_models,  # providers.models 中配置的
+        })
+    return {'ok': True, 'providers': result}
 
 
 def get_remote_skills_list():
@@ -1151,7 +1223,7 @@ def wake_agent(agent_id, message=''):
 
     def do_wake():
         try:
-            cmd = ['openclaw', 'agent', '--agent', runtime_id, '-m', msg, '--timeout', '600']
+            cmd = ['openclaw', 'agent', '--agent', runtime_id, '-m', msg, '--timeout', str(DISPATCH_AGENT_TIMEOUT)]
             log.info(f'🔔 唤醒 {agent_id}（异步投递）...')
             proc = subprocess.Popen(
                 cmd,
@@ -1176,7 +1248,12 @@ def wake_agent(agent_id, message=''):
                 log.warning(f'⚠️ {agent_id} 唤醒失败: {err}')
             # 清理僵尸进程
             def _cleanup(p=proc, aid=agent_id):
-                p.wait(timeout=600)
+                try:
+                    p.wait(timeout=DISPATCH_CLEANUP_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    log.warning(f'⚠️ {aid} 清理超时，强制终止')
+                    p.kill()
+                    p.wait(timeout=5)
             threading.Thread(target=_cleanup, daemon=True).start()
         except Exception as e:
             log.warning(f'⚠️ {agent_id} 唤醒异常: {e}')
@@ -2518,7 +2595,7 @@ def dispatch_for_state(task_id, task, new_state, trigger='state-transition'):
                     _scheduler_add_flow(t, f'通知太子（当前session）', to=t.get('org', ''))
                 ))
                 # 不跳过，直接发送消息到 main session（通过 --deliver 回当前对话）
-                cmd = [openclaw_bin, 'agent', '--agent', 'main', '-m', msg, '--deliver', '--timeout', '600']
+                cmd = [openclaw_bin, 'agent', '--agent', 'main', '-m', msg, '--deliver', '--timeout', str(DISPATCH_AGENT_TIMEOUT)]
                 log.info(f'🔄 通知太子 {task_id}（当前session投递）...')
                 try:
                     proc = subprocess.Popen(
@@ -2541,7 +2618,7 @@ def dispatch_for_state(task_id, task, new_state, trigger='state-transition'):
                     log.warning(f'⚠️ {task_id} 太子通知异常: {e}')
                 return
 
-            cmd = [openclaw_bin, 'agent', '--agent', agent_id, '-m', msg, '--timeout', '600']
+            cmd = [openclaw_bin, 'agent', '--agent', agent_id, '-m', msg, '--timeout', str(DISPATCH_AGENT_TIMEOUT)]
             if _channel:
                 cmd.extend(['--deliver', '--channel', _channel])
             log.info(f'🔄 自动派发 {task_id} → {agent_id} (异步投递)...')
@@ -2570,7 +2647,12 @@ def dispatch_for_state(task_id, task, new_state, trigger='state-transition'):
 
                 # 注册清理回调，避免僵尸进程
                 def _cleanup_proc(p=proc, tid=task_id, aid=agent_id, trig=trigger):
-                    p.wait(timeout=600)
+                    try:
+                        p.wait(timeout=DISPATCH_CLEANUP_TIMEOUT)
+                    except subprocess.TimeoutExpired:
+                        log.warning(f'⚠️ {tid} 派发清理超时，强制终止 → {aid}')
+                        p.kill()
+                        p.wait(timeout=5)
                     _rc = p.returncode
                     if _rc == 0:
                         log.info(f'✅ {tid} 派发进程正常结束 → {aid}')
@@ -2781,6 +2863,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_file(idx)
             else:
                 self.send_file(BASE / 'dashboard.html')
+        elif p == '/provider-keys':
+            self.send_file(DIST / 'provider-keys.html')
         elif p == '/healthz':
             task_data_dir = get_task_data_dir()
             checks = {'dataDir': task_data_dir.is_dir(), 'tasksReadable': (task_data_dir / 'tasks_source.json').exists()}
@@ -2879,6 +2963,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({'ok': True, 'sessions': cd_list()})
         elif p == '/api/court-discuss/officials':
             self.send_json({'ok': True, 'officials': CD_PROFILES})
+        # ── Provider API Key 管理（只读）──
+        elif p == '/api/provider-keys':
+            self.send_json(get_provider_keys())
         elif p.startswith('/api/court-discuss/session/'):
             sid = p.replace('/api/court-discuss/session/', '')
             data = cd_get(sid)
@@ -3231,6 +3318,46 @@ class Handler(BaseHTTPRequestHandler):
             atomic_json_update(DATA / 'agent_config.json', _set_channel, {})
             label = f'派发渠道已切换为 {channel}' if channel else '派发渠道已关闭'
             self.send_json({'ok': True, 'message': label})
+
+        # ── Provider API Key 管理 ──
+        elif p == '/api/provider-key':
+            # POST: 更新 Provider API Key
+            provider_name = body.get('provider', '').strip()
+            new_key = body.get('apiKey', '').strip()
+            if not provider_name or not new_key:
+                self.send_json({'ok': False, 'error': 'provider and apiKey required'}, 400)
+                return
+
+            cfg = read_json(OPENCLAW_HOME / 'openclaw.json', {})
+            providers = cfg.get('models', {}).get('providers', {})
+            if provider_name not in providers:
+                self.send_json({'ok': False, 'error': f'Provider {provider_name} 不存在'}, 404)
+                return
+
+            # 备份
+            bak = OPENCLAW_HOME / f'openclaw.json.bak.key-{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}'
+            shutil.copy2(OPENCLAW_HOME / 'openclaw.json', bak)
+
+            # 更新
+            providers[provider_name]['apiKey'] = new_key
+            atomic_json_write(OPENCLAW_HOME / 'openclaw.json', cfg)
+
+            # 异步重启 Gateway
+            def _restart_for_key():
+                try:
+                    r = subprocess.run(['openclaw', 'gateway', 'restart'], capture_output=True, text=True, timeout=30)
+                    log.info(f'Provider key 更新后 Gateway 重启 rc={r.returncode}')
+                except Exception as e:
+                    log.error(f'Provider key 更新后 Gateway 重启失败: {e}')
+                    # 回滚
+                    if bak.exists():
+                        shutil.copy2(bak, OPENCLAW_HOME / 'openclaw.json')
+                        log.warning('已回滚 openclaw.json')
+
+            threading.Thread(target=_restart_for_key, daemon=True).start()
+
+            masked = new_key[:8] + '…' + new_key[-4:] if len(new_key) > 12 else '***'
+            self.send_json({'ok': True, 'message': f'{provider_name} API Key 已更新（{masked}），Gateway 重启中', 'provider': provider_name})
 
         # ── 朝堂议政 POST ──
         elif p == '/api/court-discuss/start':

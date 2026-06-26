@@ -4,7 +4,10 @@
 #   间隔秒数：数据刷新频率，默认 15 秒
 #   巡检间隔秒数：自动重试卡住任务的频率，默认 120 秒
 
-set -euo pipefail
+# 不使用 set -e：safe_run 内部已有 || true 兜底，
+# 避免单个脚本非零退出导致整个循环终止（macOS 上 timeout 不可用，
+# 无法限制脚本执行时间，只能靠内部超时保护）
+# set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export EDICT_HOME="${EDICT_HOME:-$(dirname "$SCRIPT_DIR")}"
@@ -48,15 +51,23 @@ DASHBOARD_PORT="${EDICT_DASHBOARD_PORT:-7891}"  # 看板端口，可通过环境
 CLEANUP_INTERVAL=$((4 * 3600))  # Session 清理间隔(秒), 默认 4 小时
 CLEANUP_COUNTER=0
 
-echo "🏛️  三省六部数据刷新循环启动 (PID=$$)"
-echo "   脚本目录: $SCRIPT_DIR"
-echo "   间隔: ${INTERVAL}s"
-echo "   巡检间隔: ${SCAN_INTERVAL}s"
-echo "   清理间隔: ${CLEANUP_INTERVAL}s"
-echo "   脚本超时: ${SCRIPT_TIMEOUT}s"
-echo "   日志: $LOG"
-echo "   PID文件: $PIDFILE"
-echo "   按 Ctrl+C 停止"
+# ── 重定向所有输出到日志（launchd 模式下 stdout/stderr 已在 plist 中配置，
+#    但手动运行时也需要确保日志不丢失）──
+if [[ -t 1 ]]; then
+  echo "🏛️  三省六部数据刷新循环启动 (PID=$$)"
+else
+  echo "$(date '+%H:%M:%S') [loop] 🏛️  三省六部数据刷新循环启动 (PID=$$)" >> "$LOG"
+fi
+if [[ -t 1 ]]; then
+  echo "   脚本目录: $SCRIPT_DIR"
+  echo "   间隔: ${INTERVAL}s"
+  echo "   巡检间隔: ${SCAN_INTERVAL}s"
+  echo "   清理间隔: ${CLEANUP_INTERVAL}s"
+  echo "   脚本超时: ${SCRIPT_TIMEOUT}s"
+  echo "   日志: $LOG"
+  echo "   PID文件: $PIDFILE"
+  echo "   按 Ctrl+C 停止"
+fi
 
 # ── 安全执行（带超时保护）──
 safe_run() {
@@ -69,7 +80,17 @@ safe_run() {
       fi
     }
   else
-    "$PYTHON_BIN" "$script" >> "$LOG" 2>&1 || true
+    # macOS 无 timeout 命令，用 Python 自带 subprocess 超时
+    "$PYTHON_BIN" -c "
+import subprocess, sys
+try:
+    subprocess.run([sys.executable] + sys.argv[1:], timeout=$SCRIPT_TIMEOUT)
+except subprocess.TimeoutExpired:
+    import datetime
+    print(f'{datetime.datetime.now().strftime(\"%H:%M:%S\")} [loop] ⚠️ 脚本超时(${SCRIPT_TIMEOUT}s): {sys.argv[1]}')
+except Exception as e:
+    print(f'[loop] 脚本异常: {e}')
+" "$script" >> "$LOG" 2>&1 || true
   fi
 }
 
