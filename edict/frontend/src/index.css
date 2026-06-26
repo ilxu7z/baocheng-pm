@@ -642,6 +642,9 @@ body {
 .archive-bar .ab-scan-detail.active { border-color: var(--acc); color: var(--acc); background: #0f1a38; }
 .archive-bar .ab-scan-copy { font-size: 11px; padding: 4px 10px; border-radius: 6px; border: 1px solid #2ecc8a44; background: transparent; cursor: pointer; color: var(--ok); font-weight: 600; transition: all .15s; }
 .archive-bar .ab-scan-copy:hover { background: #0a2018; border-color: var(--ok); }
+.ab-unstuck { font-size: 11px; padding: 4px 12px; border-radius: 6px; border: 1px solid #f0b42944; background: transparent; cursor: pointer; color: #f0b429; font-weight: 600; transition: all .15s; }
+.ab-unstuck:hover { background: #1a1408; border-color: #f0b429; }
+.ab-unstuck:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /* scan detail panel */
 .global-scan-detail { display: none; margin-top: -4px; margin-bottom: 12px; background: var(--panel2); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }

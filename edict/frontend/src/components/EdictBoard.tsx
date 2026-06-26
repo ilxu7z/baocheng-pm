@@ -191,6 +191,23 @@ export default function EdictBoard() {
     } catch { toast('服务器连接失败', 'err'); }
   };
 
+  const handleSmartUnstuck = async () => {
+    try {
+      const r = await api.smartUnstuck();
+      if (r.ok) {
+        const cancelled = r.cancelled || 0;
+        const retried = r.retried || 0;
+        const total = r.count || 0;
+        let msg = '🪄 智能解卡完成：';
+        if (cancelled > 0) msg += `${cancelled} 个超时清理`;
+        if (retried > 0) msg += `${retried} 个强制续推`;
+        if (total === 0) msg += '无需处理';
+        toast(msg);
+      } else toast(r.error || '解卡失败', 'err');
+      loadAll();
+    } catch { toast('服务器连接失败', 'err'); }
+  };
+
   return (
     <div>
       {/* Archive Bar */}
@@ -212,6 +229,7 @@ export default function EdictBoard() {
           活跃 {activeEdicts.length} · 归档 {archivedEdicts.length} · 共 {allEdicts.length}
         </span>
         <button className="ab-scan" onClick={handleScan}>🧭 太子巡检</button>
+        <button className="ab-unstuck" onClick={handleSmartUnstuck}>🪄 智能解卡</button>
       </div>
 
       {/* Grid */}

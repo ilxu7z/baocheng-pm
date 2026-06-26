@@ -68,6 +68,11 @@ export const api = {
       `${API_BASE}/api/scheduler-scan`,
       { thresholdSec }
     ),
+  smartUnstuck: (thresholdHours = 12) =>
+    postJ<ActionResult & { count?: number; cancelled?: number; retried?: number; actions?: any[] }>(
+      `${API_BASE}/api/smart-unstuck`,
+      { thresholdHours }
+    ),
   schedulerRetry: (taskId: string, reason: string) =>
     postJ<ActionResult>(`${API_BASE}/api/scheduler-retry`, { taskId, reason }),
   schedulerEscalate: (taskId: string, reason: string) =>
