@@ -197,6 +197,13 @@ def _session_file_exists(task):
     return bool(session_file and pathlib.Path(session_file).exists())
 
 
+def _is_main_session(task):
+    """检查 AUTO 任务是否来自 agent:*:main 主会话（非工作任务）"""
+    import re
+    session_key = task.get('sourceMeta', {}).get('sessionKey', '') or task.get('flow', {}).get('dispatch', '')
+    return bool(re.match(r'agent:[\w-]+:main$', session_key))
+
+
 def build_task(agent_id, session_key, row, now_ms):
     # ── 字段提取（全部 safe_get，向前兼容变更）──
     session_id = row.get('sessionId') or row.get('id') or session_key
@@ -256,7 +263,7 @@ def build_task(agent_id, session_key, row, now_ms):
     # agent:*:main 是 Agent 自身的主聊天会话，不是工作任务
     if re.search(r':heartbeat', session_key) or re.search(r':dashboard:', session_key) or 'gateway-fallback' in session_key:
         return None
-    if re.match(r'agent:\w+:main$', session_key):
+    if re.match(r'agent:[\w-]+:main$', session_key):
         return None
     if re.match(r'agent:\w+:cron:', title_label):
         title = f"{org}定时任务"
@@ -419,6 +426,8 @@ def main():
                 tasks = [t for t in tasks if not (str(t.get('id', '')).startswith('JJC') and not str(t.get('id', '')).startswith('JJC-AUTO'))]
                 # 过滤掉已不存在的 AUTO 任务（session .jsonl 文件已删除但 sessions.json 还有僵尸条目）
                 jjc_existing = [t for t in jjc_existing if not (str(t.get('id', '')).startswith('JJC-AUTO') and not _session_file_exists(t))]
+                # 过滤掉 agent:*:main 主会话的 AUTO 任务（Agent 主聊天不是工作任务）
+                jjc_existing = [t for t in jjc_existing if not (str(t.get('id', '')).startswith('JJC-AUTO') and _is_main_session(t))]
                 tasks = jjc_existing + tasks
                 # 再次去重（jjc_existing 和 tasks 中可能有相同 id 的 JJC-AUTO 任务）
                 seen = set()
