@@ -14,7 +14,7 @@
         <string>7891</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>/Users/chee/Projects/oc-macs/dashboard</string>
+    <string>/Users/chee/Projects/oc-macs</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -29,6 +29,8 @@
     <dict>
         <key>PATH</key>
         <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+        <key>EDICT_HOME</key>
+        <string>/Users/chee/Projects/oc-macs</string>
     </dict>
 </dict>
 </plist>

@@ -234,55 +234,74 @@ def modify_task(task_id, updater):
 
 
 def handle_task_action(task_id, action, reason):
-    """Stop/cancel/resume a task from the dashboard."""
-    tasks = load_tasks()
-    task = next((t for t in tasks if t.get('id') == task_id), None)
-    if not task:
-        return {'ok': False, 'error': f'任务 {task_id} 不存在'}
+    """Stop/cancel/resume a task from the dashboard.
+    
+    使用 modify_tasks 原子更新，避免与 sync 脚本的 TOCTOU 竞态。
+    """
+    result = {'ok': False, 'error': f'任务 {task_id} 不存在'}
+    dispatch_needed = False
+    dispatch_state = None
 
-    old_state = task.get('state', '')
-    _ensure_scheduler(task)
-    _scheduler_snapshot(task, f'task-action-before-{action}')
+    def _do_action(tasks):
+        nonlocal result, dispatch_needed, dispatch_state
+        task = next((t for t in tasks if t.get('id') == task_id), None)
+        if not task:
+            return tasks
 
-    if action == 'stop':
-        task['state'] = 'Blocked'
-        task['block'] = reason or '皇上叫停'
-        task['now'] = f'⏸️ 已暂停：{reason}'
-        task.setdefault('_scheduler', {})['enabled'] = False
-    elif action == 'cancel':
-        task['state'] = 'Cancelled'
-        task['block'] = reason or '皇上取消'
-        task['now'] = f'🚫 已取消：{reason}'
-        task.setdefault('_scheduler', {})['enabled'] = False
-    elif action == 'resume':
-        # Resume to previous active state or Doing
-        task['state'] = task.get('_prev_state', 'Doing')
-        task['block'] = '无'
-        task['now'] = f'▶️ 已恢复执行'
-        task.setdefault('_scheduler', {})['enabled'] = True
+        old_state = task.get('state', '')
+        _ensure_scheduler(task)
+        _scheduler_snapshot(task, f'task-action-before-{action}')
 
-    if action in ('stop', 'cancel'):
-        task['_prev_state'] = old_state  # Save for resume
+        if action == 'stop':
+            task['state'] = 'Blocked'
+            task['block'] = reason or '皇上叫停'
+            task['now'] = f'⏸️ 已暂停：{reason}'
+            task.setdefault('_scheduler', {})['enabled'] = False
+        elif action == 'cancel':
+            task['state'] = 'Cancelled'
+            task['block'] = reason or '皇上取消'
+            task['now'] = f'🚫 已取消：{reason}'
+            task.setdefault('_scheduler', {})['enabled'] = False
+        elif action == 'resume':
+            task['state'] = task.get('_prev_state', 'Doing')
+            task['block'] = '无'
+            task['now'] = f'▶️ 已恢复执行'
+            task.setdefault('_scheduler', {})['enabled'] = True
 
-    task.setdefault('flow_log', []).append({
-        'at': now_iso(),
-        'from': '皇上',
-        'to': task.get('org', ''),
-        'remark': f'{"⏸️ 叫停" if action == "stop" else "🚫 取消" if action == "cancel" else "▶️ 恢复"}：{reason}'
-    })
+        if action in ('stop', 'cancel'):
+            task['_prev_state'] = old_state
 
-    if action == 'resume':
-        _scheduler_mark_progress(task, f'恢复到 {task.get("state", "Doing")}')
-    else:
-        _scheduler_add_flow(task, f'皇上{action}：{reason or "无"}')
+        task.setdefault('flow_log', []).append({
+            'at': now_iso(),
+            'from': '皇上',
+            'to': task.get('org', ''),
+            'remark': f'{"⏸️ 叫停" if action == "stop" else "🚫 取消" if action == "cancel" else "▶️ 恢复"}：{reason}'
+        })
 
-    task['updatedAt'] = now_iso()
+        if action == 'resume':
+            _scheduler_mark_progress(task, f'恢复到 {task.get("state", "Doing")}')
+        else:
+            _scheduler_add_flow(task, f'皇上{action}：{reason or "无"}')
 
-    save_tasks(tasks)
-    if action == 'resume' and task.get('state') not in _TERMINAL_STATES:
-        dispatch_for_state(task_id, task, task.get('state'), trigger='resume')
-    label = {'stop': '已叫停', 'cancel': '已取消', 'resume': '已恢复'}[action]
-    return {'ok': True, 'message': f'{task_id} {label}'}
+        task['updatedAt'] = now_iso()
+
+        if action == 'resume' and task.get('state') not in _TERMINAL_STATES:
+            dispatch_needed = True
+            dispatch_state = task.get('state')
+
+        label = {'stop': '已叫停', 'cancel': '已取消', 'resume': '已恢复'}[action]
+        result = {'ok': True, 'message': f'{task_id} {label}'}
+        return tasks
+
+    modify_tasks(_do_action)
+
+    if dispatch_needed:
+        tasks = load_tasks()
+        task = next((t for t in tasks if t.get('id') == task_id), None)
+        if task:
+            dispatch_for_state(task_id, task, dispatch_state, trigger='resume')
+
+    return result
 
 
 def handle_archive_task(task_id, archived, archive_all_done=False):
@@ -290,35 +309,42 @@ def handle_archive_task(task_id, archived, archive_all_done=False):
     
     归档非终态任务时，自动将其标记为 Cancelled，避免出现
     「已归档但状态仍是 Doing/Taizi」的混乱状态。
+    
+    使用 modify_tasks 原子更新。
     """
-    tasks = load_tasks()
-    if archive_all_done:
-        count = 0
-        for t in tasks:
-            if t.get('state') in ('Done', 'Cancelled') and not t.get('archived'):
-                t['archived'] = True
-                t['archivedAt'] = now_iso()
-                count += 1
-        save_tasks(tasks)
-        return {'ok': True, 'message': f'{count} 道旨意已归档', 'count': count}
-    task = next((t for t in tasks if t.get('id') == task_id), None)
-    if not task:
-        return {'ok': False, 'error': f'任务 {task_id} 不存在'}
-    task['archived'] = archived
-    if archived:
-        task['archivedAt'] = now_iso()
-        # 归档非终态任务时，自动标记为 Cancelled
-        if task.get('state') not in ('Done', 'Cancelled'):
-            old_state = task.get('state', '?')
-            task['state'] = 'Cancelled'
-            task['now'] = f'归档时自动取消（原状态: {old_state}）'
-            _scheduler_add_flow(task, f'归档 → 自动取消（原状态: {old_state}）')
-    else:
-        task.pop('archivedAt', None)
-    task['updatedAt'] = now_iso()
-    save_tasks(tasks)
-    label = '已归档' if archived else '已取消归档'
-    return {'ok': True, 'message': f'{task_id} {label}'}
+    result = {'ok': False, 'error': f'任务 {task_id} 不存在'}
+
+    def _do_archive(tasks):
+        nonlocal result
+        if archive_all_done:
+            count = 0
+            for t in tasks:
+                if t.get('state') in ('Done', 'Cancelled') and not t.get('archived'):
+                    t['archived'] = True
+                    t['archivedAt'] = now_iso()
+                    count += 1
+            result = {'ok': True, 'message': f'{count} 道旨意已归档', 'count': count}
+            return tasks
+        task = next((t for t in tasks if t.get('id') == task_id), None)
+        if not task:
+            return tasks
+        task['archived'] = archived
+        if archived:
+            task['archivedAt'] = now_iso()
+            if task.get('state') not in ('Done', 'Cancelled'):
+                old_state = task.get('state', '?')
+                task['state'] = 'Cancelled'
+                task['now'] = f'归档时自动取消（原状态: {old_state}）'
+                _scheduler_add_flow(task, f'归档 → 自动取消（原状态: {old_state}）')
+        else:
+            task.pop('archivedAt', None)
+        task['updatedAt'] = now_iso()
+        label = '已归档' if archived else '已取消归档'
+        result = {'ok': True, 'message': f'{task_id} {label}'}
+        return tasks
+
+    modify_tasks(_do_archive)
+    return result
 
 
 def update_task_todos(task_id, todos):
@@ -856,50 +882,68 @@ def _todo_progress(task):
 
 
 def handle_review_action(task_id, action, comment=''):
-    """门下省御批：准奏/封驳。"""
-    tasks = load_tasks()
-    task = next((t for t in tasks if t.get('id') == task_id), None)
-    if not task:
-        return {'ok': False, 'error': f'任务 {task_id} 不存在'}
-    if task.get('state') not in ('Review', 'Menxia'):
-        return {'ok': False, 'error': f'任务 {task_id} 当前状态为 {task.get("state")}，无法御批'}
+    """门下省御批：准奏/封驳。使用 modify_tasks 原子更新。"""
+    result = {'ok': False, 'error': f'任务 {task_id} 不存在'}
 
-    _ensure_scheduler(task)
-    _scheduler_snapshot(task, f'review-before-{action}')
+    def _do_review(tasks):
+        nonlocal result
+        task = next((t for t in tasks if t.get('id') == task_id), None)
+        if not task:
+            return tasks
+        if task.get('state') not in ('Review', 'Menxia'):
+            result = {'ok': False, 'error': f'任务 {task_id} 当前状态为 {task.get("state")}，无法御批'}
+            return tasks
 
-    if action == 'approve':
-        if task['state'] == 'Menxia':
-            task['state'] = 'Assigned'
-            task['now'] = '门下省准奏，移交尚书省派发'
-            remark = f'✅ 准奏：{comment or "门下省审议通过"}'
-            to_dept = '尚书省'
-        else:  # Review
-            completed, total = _todo_progress(task)
-            if total > 0 and completed < total:
-                return {'ok': False, 'error': f'子任务尚未全部完成（{completed}/{total}），不能直接准奏完结'}
-            task['state'] = 'Done'
-            task['now'] = '御批通过，任务完成'
-            remark = f'✅ 御批准奏：{comment or "审查通过"}'
-            to_dept = '皇上'
-    elif action == 'reject':
-        round_num = (task.get('review_round') or 0) + 1
-        task['review_round'] = round_num
-        task['state'] = 'Zhongshu'
-        task['now'] = f'封驳退回中书省修订（第{round_num}轮）'
-        remark = f'🚫 封驳：{comment or "需要修改"}'
-        to_dept = '中书省'
-    else:
-        return {'ok': False, 'error': f'未知操作: {action}'}
+        _ensure_scheduler(task)
+        _scheduler_snapshot(task, f'review-before-{action}')
 
-    task.setdefault('flow_log', []).append({
-        'at': now_iso(),
-        'from': '门下省' if task.get('state') != 'Done' else '皇上',
-        'to': to_dept,
-        'remark': remark
-    })
-    _scheduler_mark_progress(task, f'审议动作 {action} -> {task.get("state")}')
-    task['updatedAt'] = now_iso()
-    save_tasks(tasks)
+        if action == 'approve':
+            if task['state'] == 'Menxia':
+                task['state'] = 'Assigned'
+                task['now'] = '门下省准奏，移交尚书省派发'
+                remark = f'✅ 准奏：{comment or "门下省审议通过"}'
+                to_dept = '尚书省'
+            else:  # Review
+                completed, total = _todo_progress(task)
+                if total > 0 and completed < total:
+                    result = {'ok': False, 'error': f'子任务尚未全部完成（{completed}/{total}），不能直接准奏完结'}
+                    return tasks
+                task['state'] = 'Done'
+                task['now'] = '御批通过，任务完成'
+                remark = f'✅ 御批准奏：{comment or "审查通过"}'
+                to_dept = '皇上'
+        elif action == 'reject':
+            round_num = (task.get('review_round') or 0) + 1
+            task['review_round'] = round_num
+            task['state'] = 'Zhongshu'
+            task['now'] = f'封驳退回中书省修订（第{round_num}轮）'
+            remark = f'🚫 封驳：{comment or "需要修改"}'
+            to_dept = '中书省'
+        else:
+            result = {'ok': False, 'error': f'未知操作: {action}'}
+            return tasks
+
+        task.setdefault('flow_log', []).append({
+            'at': now_iso(),
+            'from': '门下省' if task.get('state') != 'Done' else '皇上',
+            'to': to_dept,
+            'remark': remark
+        })
+        _scheduler_mark_progress(task, f'审议动作 {action} -> {task.get("state")}')
+        task['updatedAt'] = now_iso()
+        result = {'ok': True, 'message': f'{task_id} 御批完成'}
+        return tasks
+
+    modify_tasks(_do_review)
+
+    # 🚀 审批后自动派发对应 Agent（在锁外执行，避免阻塞）
+    if result.get('ok'):
+        tasks = load_tasks()
+        task = next((t for t in tasks if t.get('id') == task_id), None)
+        if task and task.get('state') not in ('Done',):
+            dispatch_for_state(task_id, task, task.get('state'))
+
+    return result
 
     # 🚀 审批后自动派发对应 Agent
     new_state = task['state']
@@ -2738,39 +2782,56 @@ def dispatch_for_state(task_id, task, new_state, trigger='state-transition'):
 
 
 def handle_advance_state(task_id, comment=''):
-    """手动推进任务到下一阶段（解卡用），推进后自动派发对应 Agent。"""
-    tasks = load_tasks()
-    task = next((t for t in tasks if t.get('id') == task_id), None)
-    if not task:
-        return {'ok': False, 'error': f'任务 {task_id} 不存在'}
-    cur = task.get('state', '')
-    if cur not in _STATE_FLOW:
-        return {'ok': False, 'error': f'任务 {task_id} 状态为 {cur}，无法推进'}
-    _ensure_scheduler(task)
-    _scheduler_snapshot(task, f'advance-before-{cur}')
-    next_state, from_dept, to_dept, default_remark = _STATE_FLOW[cur]
-    remark = comment or default_remark
+    """手动推进任务到下一阶段（解卡用），推进后自动派发对应 Agent。
+    使用 modify_tasks 原子更新。"""
+    result = {'ok': False, 'error': f'任务 {task_id} 不存在'}
+    dispatch_needed = False
+    dispatch_state = None
 
-    task['state'] = next_state
-    task['now'] = f'⬇️ 手动推进：{remark}'
-    task.setdefault('flow_log', []).append({
-        'at': now_iso(),
-        'from': from_dept,
-        'to': to_dept,
-        'remark': f'⬇️ 手动推进：{remark}'
-    })
-    _scheduler_mark_progress(task, f'手动推进 {cur} -> {next_state}')
-    task['updatedAt'] = now_iso()
-    save_tasks(tasks)
+    def _do_advance(tasks):
+        nonlocal result, dispatch_needed, dispatch_state
+        task = next((t for t in tasks if t.get('id') == task_id), None)
+        if not task:
+            return tasks
+        cur = task.get('state', '')
+        if cur not in _STATE_FLOW:
+            result = {'ok': False, 'error': f'任务 {task_id} 状态为 {cur}，无法推进'}
+            return tasks
+        _ensure_scheduler(task)
+        _scheduler_snapshot(task, f'advance-before-{cur}')
+        next_state, from_dept, to_dept, default_remark = _STATE_FLOW[cur]
+        remark = comment or default_remark
 
-    # 🚀 推进后自动派发对应 Agent（Done 状态无需派发）
-    if next_state != 'Done':
-        dispatch_for_state(task_id, task, next_state)
+        task['state'] = next_state
+        task['now'] = f'⬇️ 手动推进：{remark}'
+        task.setdefault('flow_log', []).append({
+            'at': now_iso(),
+            'from': from_dept,
+            'to': to_dept,
+            'remark': f'⬇️ 手动推进：{remark}'
+        })
+        _scheduler_mark_progress(task, f'手动推进 {cur} -> {next_state}')
+        task['updatedAt'] = now_iso()
 
-    from_label = _STATE_LABELS.get(cur, cur)
-    to_label = _STATE_LABELS.get(next_state, next_state)
-    dispatched = ' (已自动派发 Agent)' if next_state != 'Done' else ''
-    return {'ok': True, 'message': f'{task_id} {from_label} → {to_label}{dispatched}'}
+        if next_state != 'Done':
+            dispatch_needed = True
+            dispatch_state = next_state
+
+        from_label = _STATE_LABELS.get(cur, cur)
+        to_label = _STATE_LABELS.get(next_state, next_state)
+        dispatched = ' (已自动派发 Agent)' if next_state != 'Done' else ''
+        result = {'ok': True, 'message': f'{task_id} {from_label} → {to_label}{dispatched}'}
+        return tasks
+
+    modify_tasks(_do_advance)
+
+    if dispatch_needed:
+        tasks = load_tasks()
+        task = next((t for t in tasks if t.get('id') == task_id), None)
+        if task:
+            dispatch_for_state(task_id, task, dispatch_state)
+
+    return result
 
 
 class Handler(BaseHTTPRequestHandler):
