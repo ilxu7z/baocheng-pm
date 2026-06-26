@@ -391,6 +391,7 @@ def cmd_state(task_id, new_state, now_text=None):
             }
             t['now'] = f'待确认: {old_state[0]}→{new_state}'
             t['updatedAt'] = now_iso()
+            t.setdefault('_scheduler', {})['lastProgressAt'] = now_iso()
             pending_confirm[0] = True
             return tasks
         t['state'] = new_state
@@ -399,6 +400,7 @@ def cmd_state(task_id, new_state, now_text=None):
         if now_text:
             t['now'] = now_text
         t['updatedAt'] = now_iso()
+        t.setdefault('_scheduler', {})['lastProgressAt'] = now_iso()
         return tasks
     atomic_json_update(TASKS_FILE, modifier, [])
     _trigger_refresh()
@@ -430,6 +432,7 @@ def cmd_flow(task_id, from_dept, to_dept, remark):
         # 同步更新 org，使看板能正确显示当前所属部门
         t['org'] = to_dept
         t['updatedAt'] = now_iso()
+        t.setdefault('_scheduler', {})['lastProgressAt'] = now_iso()
         return tasks
     atomic_json_update(TASKS_FILE, modifier, [])
     _trigger_refresh()
@@ -475,6 +478,7 @@ def cmd_done(task_id, output_path='', summary=''):
             else:
                 t['outputMeta'] = {"exists": False, "lastModified": None}
         t['updatedAt'] = now_iso()
+        t.setdefault('_scheduler', {})['lastProgressAt'] = now_iso()
         return tasks
     atomic_json_update(TASKS_FILE, modifier, [])
     _trigger_refresh()
@@ -503,6 +507,7 @@ def cmd_block(task_id, reason):
         t['state'] = 'Blocked'
         t['block'] = reason
         t['updatedAt'] = now_iso()
+        t.setdefault('_scheduler', {})['lastProgressAt'] = now_iso()
         return tasks
     atomic_json_update(TASKS_FILE, modifier, [])
     _trigger_refresh()
@@ -546,6 +551,7 @@ def cmd_confirm(task_id, action, reason=''):
             return tasks
         t.pop('pending_confirm', None)
         t['updatedAt'] = now_iso()
+        t.setdefault('_scheduler', {})['lastProgressAt'] = now_iso()
         t.setdefault('flow_log', []).append({
             'at': now_iso(), 'from': 'PendingConfirm', 'to': result_state[0],
             'remark': f'{"✅ 批准" if action == "approve" else "❌ 驳回"}: {reason}',
@@ -641,6 +647,8 @@ def cmd_progress(task_id, now_text, todos_pipe='', tokens=0, cost=0.0, elapsed=0
         if len(t['progress_log']) > MAX_PROGRESS_LOG:
             t['progress_log'] = t['progress_log'][-MAX_PROGRESS_LOG:]
         t['updatedAt'] = at
+        # 同步更新调度器 lastProgressAt，防止巡检误判 Agent 正在工作中为停滞
+        t.setdefault('_scheduler', {})['lastProgressAt'] = at
         done_cnt[0] = sum(1 for td in t.get('todos', []) if td.get('status') == 'completed')
         total_cnt[0] = len(t.get('todos', []))
         return tasks
@@ -699,6 +707,7 @@ def cmd_todo(task_id, todo_id, title, status='not-started', detail=''):
                 item['detail'] = detail
             t['todos'].append(item)
         t['updatedAt'] = now_iso()
+        t.setdefault('_scheduler', {})['lastProgressAt'] = now_iso()
         result_info[0] = sum(1 for td in t['todos'] if td.get('status') == 'completed')
         result_info[1] = len(t['todos'])
         # 所有 todo 完成 → 标记 ready_to_close
@@ -917,6 +926,7 @@ def cmd_delegate_result(sub_task_id, result_json):
             t['state'] = 'Done'
             t['now'] = f'委派结果已提交'
             t['updatedAt'] = now_iso()
+            t.setdefault('_scheduler', {})['lastProgressAt'] = now_iso()
             t['delegation_result'] = result_json
         return tasks
     atomic_json_update(TASKS_FILE, modifier, [])
