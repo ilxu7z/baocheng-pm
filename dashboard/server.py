@@ -48,7 +48,7 @@ from channels import get_channel, get_channel_info, CHANNELS as NOTIFICATION_CHA
 # openclaw agent 正常应在 30s 内完成，但复杂任务可能需要更久
 # 120s 足够覆盖绝大多数场景，同时避免僵尸进程无限挂起
 DISPATCH_AGENT_TIMEOUT = 120  # 秒
-DISPATCH_CLEANUP_TIMEOUT = 180  # 清理线程超时（比 agent 超时多 60s 缓冲）
+DISPATCH_CLEANUP_TIMEOUT = 30  # 清理线程超时：确认进程启动后快速清理，避免 8 次 TimeoutExpired
 
 # ── 内存缓存（减少磁盘 I/O）──
 _CACHE = {}
@@ -1290,7 +1290,7 @@ def wake_agent(agent_id, message=''):
             else:
                 err = proc.stderr.read()[:200] if proc.stderr else '未知错误'
                 log.warning(f'⚠️ {agent_id} 唤醒失败: {err}')
-            # 清理僵尸进程
+            # 清理僵尸进程：确认投递后快速释放，不等待 agent 回复
             def _cleanup(p=proc, aid=agent_id):
                 try:
                     p.wait(timeout=DISPATCH_CLEANUP_TIMEOUT)
@@ -1332,9 +1332,30 @@ def _parse_iso(ts):
     if not ts or not isinstance(ts, str):
         return None
     try:
-        return datetime.datetime.fromisoformat(ts.replace('Z', '+00:00'))
+        dt = datetime.datetime.fromisoformat(ts.replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt
     except Exception:
         return None
+
+
+def _ensure_aware(dt):
+    """确保 datetime 有时区信息，naive → UTC"""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=datetime.timezone.utc)
+    return dt
+
+
+def _safe_delta_sec(dt_a, dt_b):
+    """安全计算两个 datetime 的秒差，自动统一时区"""
+    a = _ensure_aware(dt_a)
+    b = _ensure_aware(dt_b)
+    if a is None or b is None:
+        return 0
+    return max(0, int((a - b).total_seconds()))
 
 
 def _ensure_scheduler(task):
@@ -1434,9 +1455,7 @@ def get_scheduler_state(task_id):
     sched = _ensure_scheduler(task)
     last_progress = _parse_iso(sched.get('lastProgressAt') or task.get('updatedAt'))
     now_dt = datetime.datetime.now(datetime.timezone.utc)
-    stalled_sec = 0
-    if last_progress:
-        stalled_sec = max(0, int((now_dt - last_progress).total_seconds()))
+    stalled_sec = _safe_delta_sec(now_dt, last_progress)
     return {
         'ok': True,
         'taskId': task_id,
@@ -1591,7 +1610,7 @@ def handle_scheduler_scan(threshold_sec=600):
             last_progress = _parse_iso(sched.get('lastProgressAt') or task.get('updatedAt'))
             if not last_progress:
                 continue
-            stalled_sec = max(0, int((now_dt - last_progress).total_seconds()))
+            stalled_sec = _safe_delta_sec(now_dt, last_progress)
             if stalled_sec < task_threshold:
                 continue
 
@@ -1727,7 +1746,7 @@ def handle_smart_unstuck(threshold_hours=12):
             last_progress = _parse_iso(sched.get('lastProgressAt') or task.get('updatedAt'))
             if not last_progress:
                 continue
-            stalled_sec = max(0, int((now_dt - last_progress).total_seconds()))
+            stalled_sec = _safe_delta_sec(now_dt, last_progress)
 
             if stalled_sec > threshold_sec:
                 # 超时 → 清理
@@ -2776,11 +2795,12 @@ def dispatch_for_state(task_id, task, new_state, trigger='state-transition'):
                     log.info(f'✅ {task_id} 自动派发已投递（agent处理中） → {agent_id}')
 
                 # 注册清理回调，避免僵尸进程
+                # ⚡ 修复：缩短清理超时，避免 8 次 TimeoutExpired 堆叠
                 def _cleanup_proc(p=proc, tid=task_id, aid=agent_id, trig=trigger):
                     try:
                         p.wait(timeout=DISPATCH_CLEANUP_TIMEOUT)
                     except subprocess.TimeoutExpired:
-                        log.warning(f'⚠️ {tid} 派发清理超时，强制终止 → {aid}')
+                        log.warning(f'⚠️ {tid} 派发清理超时({DISPATCH_CLEANUP_TIMEOUT}s)，强制终止 → {aid}')
                         p.kill()
                         p.wait(timeout=5)
                     _rc = p.returncode
@@ -3130,6 +3150,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 self.send_file(BASE / 'dashboard.html')
                 return
+            log.debug(f'404 未匹配路径: {self.path}')
             self.send_error(404)
 
     def do_POST(self):

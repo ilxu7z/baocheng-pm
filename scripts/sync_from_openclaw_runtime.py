@@ -427,7 +427,12 @@ def main():
                 # 过滤掉已不存在的 AUTO 任务（session .jsonl 文件已删除但 sessions.json 还有僵尸条目）
                 jjc_existing = [t for t in jjc_existing if not (str(t.get('id', '')).startswith('JJC-AUTO') and not _session_file_exists(t))]
                 # 过滤掉 agent:*:main 主会话的 AUTO 任务（Agent 主聊天不是工作任务）
-                jjc_existing = [t for t in jjc_existing if not (str(t.get('id', '')).startswith('JJC-AUTO') and _is_main_session(t))]
+                # ⚡ 防御：_is_main_session 未定义时跳过过滤
+                try:
+                    jjc_existing = [t for t in jjc_existing if not (str(t.get('id', '')).startswith('JJC-AUTO') and _is_main_session(t))]
+                except NameError:
+                    log.warning('_is_main_session 未定义，跳过主会话过滤')
+                    pass
                 tasks = jjc_existing + tasks
                 # 再次去重（jjc_existing 和 tasks 中可能有相同 id 的 JJC-AUTO 任务）
                 seen = set()
