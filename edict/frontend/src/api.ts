@@ -73,6 +73,11 @@ export const api = {
       `${API_BASE}/api/smart-unstuck`,
       { thresholdHours }
     ),
+  deepClean: () =>
+    postJ<ActionResult & { killed?: number; deletedFiles?: number; freedMb?: number }>(
+      `${API_BASE}/api/deep-clean`,
+      {}
+    ),
   schedulerRetry: (taskId: string, reason: string) =>
     postJ<ActionResult>(`${API_BASE}/api/scheduler-retry`, { taskId, reason }),
   schedulerEscalate: (taskId: string, reason: string) =>

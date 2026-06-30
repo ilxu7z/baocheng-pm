@@ -50,6 +50,8 @@ SCRIPT_TIMEOUT=30  # 单个脚本最大执行时间(秒)
 DASHBOARD_PORT="${EDICT_DASHBOARD_PORT:-7891}"  # 看板端口，可通过环境变量覆盖
 CLEANUP_INTERVAL=$((4 * 3600))  # Session 清理间隔(秒), 默认 4 小时
 CLEANUP_COUNTER=0
+ZOMBIE_KILL_INTERVAL=$((30 * 60))  # 僵尸进程清理间隔(秒), 默认 30 分钟
+ZOMBIE_COUNTER=0
 
 # ── 重定向所有输出到日志（launchd 模式下 stdout/stderr 已在 plist 中配置，
 #    但手动运行时也需要确保日志不丢失）──
@@ -117,6 +119,43 @@ while true; do
     CLEANUP_COUNTER=0
     echo "$(date '+%H:%M:%S') [loop] 🧹 开始 session 清理" >> "$LOG"
     "$PYTHON_BIN" "$SCRIPT_DIR/session_cleaner.py" >> "$LOG" 2>&1 || true
+  fi
+
+  # 定期清理僵尸 Agent 进程（超过2小时的非 gateway openclaw-agent）
+  ZOMBIE_COUNTER=$((ZOMBIE_COUNTER + INTERVAL))
+  if (( ZOMBIE_COUNTER >= ZOMBIE_KILL_INTERVAL )); then
+    ZOMBIE_COUNTER=0
+    echo "$(date '+%H:%M:%S') [loop] 🧟 开始僵尸进程清理" >> "$LOG"
+    "$PYTHON_BIN" -c "
+import subprocess, time, os
+
+now = time.time()
+result = subprocess.run(['ps', 'aux'], capture_output=True, text=True, timeout=10)
+killed = 0
+for line in result.stdout.split(chr(10)):
+    if 'openclaw-agent' not in line or 'grep' in line:
+        continue
+    parts = line.split()
+    if len(parts) < 11:
+        continue
+    try:
+        pid = int(parts[1])
+    except:
+        continue
+    if 'gateway' in line:
+        continue
+    if 'main' in line:
+        continue
+    try:
+        os.kill(pid, 9)
+        killed += 1
+    except:
+        pass
+if killed:
+    print(f'[{time.strftime(\"%H:%M:%S\")}] 🧟 终止 {killed} 个僵尸进程')
+else:
+    print(f'[{time.strftime(\"%H:%M:%S\")}] ✅ 无僵尸进程')
+" >> "$LOG" 2>&1 || true
   fi
 
   sleep "$INTERVAL"

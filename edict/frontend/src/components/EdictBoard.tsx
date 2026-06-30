@@ -191,6 +191,22 @@ export default function EdictBoard() {
     } catch { toast('服务器连接失败', 'err'); }
   };
 
+  const handleDeepClean = async () => {
+    if (!confirm('🧹 深度清理将终止所有超过2小时的僵尸Agent进程，并清理过期session文件。继续吗？')) return;
+    try {
+      const r = await api.deepClean();
+      if (r.ok) {
+        let msg = '🧹 深度清理完成：';
+        if (r.killed) msg += `终止 ${r.killed} 个僵尸进程`;
+        if (r.deletedFiles) msg += ` · 清理 ${r.deletedFiles} 个session文件`;
+        if (r.freedMb) msg += ` · 释放 ${r.freedMb}MB`;
+        if (!r.killed && !r.deletedFiles) msg += '无需处理';
+        toast(msg);
+      } else toast(r.error || '深度清理失败', 'err');
+      loadAll();
+    } catch { toast('服务器连接失败', 'err'); }
+  };
+
   const handleSmartUnstuck = async () => {
     try {
       const r = await api.smartUnstuck();
@@ -230,6 +246,7 @@ export default function EdictBoard() {
         </span>
         <button className="ab-scan" onClick={handleScan}>🧭 太子巡检</button>
         <button className="ab-unstuck" onClick={handleSmartUnstuck}>🪄 智能解卡</button>
+        <button className="ab-deep-clean" onClick={handleDeepClean}>🧹 深度清理</button>
       </div>
 
       {/* Grid */}

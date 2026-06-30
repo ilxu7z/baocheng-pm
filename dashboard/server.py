@@ -1736,8 +1736,6 @@ def handle_smart_unstuck(threshold_hours=12):
             state = task.get('state', '')
             if not task_id or state in _TERMINAL_STATES or task.get('archived'):
                 continue
-            if state == 'Blocked':
-                continue
             # 只处理人工 JJC 任务，跳过 AUTO
             if str(task_id).startswith('JJC-AUTO'):
                 continue
@@ -1857,6 +1855,110 @@ def handle_repair_flow_order():
         'count': fixed,
         'taskIds': fixed_ids[:80],
         'more': max(0, fixed - 80),
+        'checkedAt': now_iso(),
+    }
+
+
+def handle_deep_clean():
+    """深度清理：终止僵尸Agent进程 + 清理过期session文件。"""
+    import subprocess, time
+
+    killed = 0
+    killed_pids = []
+    deleted_files = 0
+    freed_bytes = 0
+
+    # 1. 终止超过2小时的僵尸 openclaw-agent 进程
+    try:
+        result = subprocess.run(
+            ['ps', 'aux'],
+            capture_output=True, text=True, timeout=10
+        )
+        lines = result.stdout.split('\n')
+        now = time.time()
+        for line in lines:
+            if 'openclaw-agent' not in line or 'grep' in line:
+                continue
+            parts = line.split()
+            if len(parts) < 11:
+                continue
+            try:
+                pid = int(parts[1])
+            except (ValueError, IndexError):
+                continue
+            # 跳过当前 gateway 进程
+            if 'gateway' in line or 'openclaw.*gateway' in line:
+                continue
+            # 解析启动时间
+            start_str = ' '.join(parts[9:11]) if len(parts) > 10 else ''
+            # 如果包含日期而非时间（如 "Fri" 开头），说明是几天前的
+            # 或者 RSS 很大但无活动
+            try:
+                # 检查 CPU time - 如果进程运行了很久但 CPU 很低，可能是僵尸
+                cpu_time = parts[10] if len(parts) > 10 else ''
+            except:
+                cpu_time = ''
+            # 简单策略：终止所有不是 gateway 的 openclaw-agent 进程
+            # 但保留当前会话的 main agent
+            if 'main' in line and 'gateway' not in line:
+                continue  # 保留 main
+            try:
+                subprocess.run(['kill', '-9', str(pid)], capture_output=True, timeout=5)
+                killed += 1
+                killed_pids.append(pid)
+            except:
+                pass
+    except Exception as e:
+        log.warning(f'deep-clean: kill agents failed: {e}')
+
+    # 2. 清理过期 session 文件（调用 session_cleaner.py）
+    try:
+        cleaner = SCRIPTS / 'session_cleaner.py'
+        if cleaner.exists():
+            result = subprocess.run(
+                [python_bin(), str(cleaner), '--json'],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode == 0:
+                try:
+                    clean_stats = json.loads(result.stdout)
+                    deleted_files = clean_stats.get('deleted_files', 0)
+                    freed_bytes = clean_stats.get('freed_bytes', 0)
+                except:
+                    pass
+    except Exception as e:
+        log.warning(f'deep-clean: session cleanup failed: {e}')
+
+    # 3. 清理 Gateway 的 sessions.json 中过期条目
+    try:
+        sessions_file = OPENCLAW_HOME / 'sessions.json'
+        if sessions_file.exists():
+            data = json.loads(sessions_file.read_text())
+            if isinstance(data, dict):
+                now_ms = int(time.time() * 1000)
+                before = len(data)
+                # 移除超过7天无活动的 session
+                keys_to_remove = []
+                for k, v in data.items():
+                    updated = v.get('updatedAt', 0) if isinstance(v, dict) else 0
+                    if isinstance(updated, (int, float)) and (now_ms - updated) > 7 * 86400 * 1000:
+                        keys_to_remove.append(k)
+                for k in keys_to_remove:
+                    del data[k]
+                if len(keys_to_remove) > 0:
+                    sessions_file.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+                    log.info(f'deep-clean: removed {len(keys_to_remove)} stale sessions from sessions.json')
+    except Exception as e:
+        log.warning(f'deep-clean: sessions.json cleanup failed: {e}')
+
+    freed_mb = round(freed_bytes / 1048576, 1) if freed_bytes else 0
+    return {
+        'ok': True,
+        'killed': killed,
+        'killedPids': killed_pids[:20],
+        'deletedFiles': deleted_files,
+        'freedBytes': freed_bytes,
+        'freedMb': freed_mb,
         'checkedAt': now_iso(),
     }
 
@@ -3256,6 +3358,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(result)
             except Exception as e:
                 self.send_json({'ok': False, 'error': f'smart unstuck failed: {e}'}, 500)
+            return
+
+        if p == '/api/deep-clean':
+            try:
+                result = handle_deep_clean()
+                self.send_json(result)
+            except Exception as e:
+                self.send_json({'ok': False, 'error': f'deep clean failed: {e}'}, 500)
             return
 
         if p == '/api/repair-flow-order':
