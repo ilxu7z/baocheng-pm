@@ -1602,7 +1602,24 @@ def handle_scheduler_scan(threshold_sec=600):
                 continue
             # JJC-AUTO 任务是 Agent 会话的被动镜像，不应被调度器派发
             # 它们只是告诉看板「这个 Agent 刚才在活跃」，不是待办工作
+            # 但如果已完成且停滞 > 1h，自动归档
             if str(task_id).startswith('JJC-AUTO'):
+                source_meta = task.get('sourceMeta') or {}
+                if source_meta and not source_meta.get('abortedLastRun'):
+                    last_ms = source_meta.get('updatedAt')
+                    if last_ms:
+                        last_dt = datetime.datetime.fromtimestamp(last_ms / 1000, tz=datetime.timezone.utc)
+                        stalled_sec = _safe_delta_sec(now_dt, last_dt)
+                        if stalled_sec > 3600:
+                            old_state = task.get('state', '?')
+                            task['state'] = 'Done'
+                            task['now'] = '✅ 自动归档（AUTO任务已完成）'
+                            sched = _ensure_scheduler(task)
+                            sched['enabled'] = False
+                            _scheduler_add_flow(task, f'太子巡检：AUTO任务已完成（原状态: {old_state}），自动归档')
+                            task['updatedAt'] = now_iso()
+                            actions.append({'taskId': task_id, 'action': 'auto-archive', 'stalledHours': stalled_sec // 3600})
+                            changed = True
                 continue
 
             sched = _ensure_scheduler(task)
@@ -1736,8 +1753,25 @@ def handle_smart_unstuck(threshold_hours=12):
             state = task.get('state', '')
             if not task_id or state in _TERMINAL_STATES or task.get('archived'):
                 continue
-            # 只处理人工 JJC 任务，跳过 AUTO
+            # JJC-AUTO 任务：已完成则自动归档，否则跳过
             if str(task_id).startswith('JJC-AUTO'):
+                source_meta = task.get('sourceMeta') or {}
+                if source_meta and not source_meta.get('abortedLastRun'):
+                    # 用 sourceMeta.updatedAt（ms）判断最后活跃时间
+                    last_ms = source_meta.get('updatedAt')
+                    if last_ms:
+                        last_dt = datetime.datetime.fromtimestamp(last_ms / 1000, tz=datetime.timezone.utc)
+                        stalled_sec = _safe_delta_sec(now_dt, last_dt)
+                        if stalled_sec > 3600:
+                            old_state = task.get('state', '?')
+                            task['state'] = 'Done'
+                            task['now'] = '✅ 自动归档（AUTO任务已完成）'
+                            sched = _ensure_scheduler(task)
+                            sched['enabled'] = False
+                            _scheduler_add_flow(task, f'智能解卡：AUTO任务已完成（原状态: {old_state}），自动归档')
+                            task['updatedAt'] = now_iso()
+                            actions.append({'taskId': task_id, 'action': 'auto-archive', 'stalledHours': stalled_sec // 3600})
+                            continue
                 continue
 
             sched = _ensure_scheduler(task)
@@ -1758,6 +1792,9 @@ def handle_smart_unstuck(threshold_hours=12):
                 actions.append({'taskId': task_id, 'action': 'cancel', 'stalledHours': stalled_sec // 3600, 'oldState': old_state})
             else:
                 # 未超时 → 重置调度器 + 强制续推
+                # 停滞 < 30 分钟的任务跳过续推，避免误触刚创建的正常任务
+                if stalled_sec < 1800:
+                    continue
                 sched['retryCount'] = 0
                 sched['escalationLevel'] = 0
                 sched['rollbackCount'] = 0
