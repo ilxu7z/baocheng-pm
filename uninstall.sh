@@ -66,8 +66,9 @@ unregister_agents() {
   cp "$OC_CFG" "$OC_CFG.bak.pre-uninstall-$(date +%Y%m%d-%H%M%S)"
   log "已备份当前配置"
 
+  export EDICT_HOME="$REPO_DIR"
   python3 << 'PYEOF'
-import json, pathlib
+import json, os, pathlib
 
 cfg_path = pathlib.Path.home() / '.openclaw' / 'openclaw.json'
 if not cfg_path.exists():
@@ -80,10 +81,10 @@ except Exception as e:
     print(f"  解析 openclaw.json 失败: {e}")
     exit(1)
 
+repo_dir = os.environ.get('EDICT_HOME', str(pathlib.Path.cwd()))
 AGENTS_TO_REMOVE = {
-    "taizi", "zhongshu", "menxia", "shangshu",
-    "hubu", "libu", "bingbu", "xingbu", "gongbu",
-    "libu_hr", "zaochao"
+    a["id"] for a in json.load(open(pathlib.Path(repo_dir) / 'registry.json'))
+    if a["id"] != "main"
 }
 
 agents_list = cfg.get('agents', {}).get('list', [])
@@ -103,7 +104,12 @@ PYEOF
 remove_workspaces() {
   info "清除 Agent Workspace 目录..."
 
-  AGENTS=(taizi zhongshu menxia shangshu hubu libu bingbu xingbu gongbu libu_hr zaochao)
+  # 从 registry.json 动态加载 Agent 列表（排除 main）
+  AGENTS=($(python3 -c "
+import json
+reg = json.load(open('$REPO_DIR/registry.json'))
+print(' '.join(a['id'] for a in reg if a['id'] != 'main'))
+"))
   removed=0
   for agent in "${AGENTS[@]}"; do
     ws="$OC_HOME/workspace-$agent"

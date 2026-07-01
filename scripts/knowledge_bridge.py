@@ -21,6 +21,10 @@ knowledge_bridge.py — 记忆系统双向桥接
 """
 import json, pathlib, datetime, logging, re, sys, os
 
+# 导入公共工具函数
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from utils import get_openclaw_home
+
 log = logging.getLogger('knowledge_bridge')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(message)s', datefmt='%H:%M:%S')
 
@@ -30,7 +34,7 @@ AGENT_MEMORY_DIR = DATA / 'agent_memory'
 TASK_MEMORY_DIR = DATA / 'task_memory'
 SHARED_MEMORY_FILE = DATA / 'shared_memory.json'
 
-OCLAW_HOME = pathlib.Path.home() / '.openclaw'
+OCLAW_HOME = get_openclaw_home()
 SHARED_KNOWLEDGE_DIR = OCLAW_HOME / 'workspace-main' / 'shared-knowledge'
 
 # ── 工具函数 ──

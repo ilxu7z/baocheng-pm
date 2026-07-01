@@ -601,7 +601,7 @@ def main():
         '',
         f'**测试时间**: {time.strftime("%Y-%m-%d %H:%M:%S")}',
         f'**测试脚本**: scripts/toctou_test_runner.py',
-        f'**测试对象**: /Users/chee/Projects/oc-macs/',
+        f'**测试对象**: {_BASE}/',
         '',
         '## 修正说明',
         '',

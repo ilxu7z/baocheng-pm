@@ -8,11 +8,11 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>/Users/chee/Projects/oc-macs/scripts/run_loop.sh</string>
+        <string>{{REPO_DIR}}/scripts/run_loop.sh</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>/Users/chee/Projects/oc-macs</string>
+    <string>{{REPO_DIR}}</string>
 
     <key>RunAtLoad</key>
     <true/>
@@ -34,7 +34,7 @@
         <key>PATH</key>
         <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
         <key>EDICT_HOME</key>
-        <string>/Users/chee/Projects/oc-macs</string>
+        <string>{{REPO_DIR}}</string>
         <key>EDICT_PYTHON</key>
         <string>/usr/local/bin/python3</string>
     </dict>
