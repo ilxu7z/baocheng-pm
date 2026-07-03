@@ -311,36 +311,44 @@ def handle_archive_task(task_id, archived, archive_all_done=False):
     「已归档但状态仍是 Doing/Taizi」的混乱状态。
     
     使用 modify_tasks 原子更新。
+    
+    关键行为：已终态（Done/Cancelled）的任务归档后直接从 tasks_source.json 中
+    删除，避免累积「已取消」任务永远挂在官员卡片下。
     """
     result = {'ok': False, 'error': f'任务 {task_id} 不存在'}
 
     def _do_archive(tasks):
         nonlocal result
         if archive_all_done:
-            count = 0
-            for t in tasks:
-                if t.get('state') in ('Done', 'Cancelled') and not t.get('archived'):
-                    t['archived'] = True
-                    t['archivedAt'] = now_iso()
-                    count += 1
-            result = {'ok': True, 'message': f'{count} 道旨意已归档', 'count': count}
+            # 批量归档：删除所有已终态且已归档的任务
+            before = len(tasks)
+            tasks = [t for t in tasks if t.get('state') not in ('Done', 'Cancelled') or not t.get('archived')]
+            count = before - len(tasks)
+            result = {'ok': True, 'message': f'{count} 道旨意已归档清理', 'count': count}
             return tasks
         task = next((t for t in tasks if t.get('id') == task_id), None)
         if not task:
             return tasks
-        task['archived'] = archived
         if archived:
-            task['archivedAt'] = now_iso()
-            if task.get('state') not in ('Done', 'Cancelled'):
+            # 归档：终态任务直接删除，非终态任务标记 Cancelled 后删除
+            if task.get('state') in ('Done', 'Cancelled'):
+                tasks = [t for t in tasks if t.get('id') != task_id]
+                result = {'ok': True, 'message': f'{task_id} 已归档清理'}
+            else:
+                task['archived'] = True
+                task['archivedAt'] = now_iso()
                 old_state = task.get('state', '?')
                 task['state'] = 'Cancelled'
                 task['now'] = f'归档时自动取消（原状态: {old_state}）'
                 _scheduler_add_flow(task, f'归档 → 自动取消（原状态: {old_state}）')
+                task['updatedAt'] = now_iso()
+                result = {'ok': True, 'message': f'{task_id} 已归档（原状态: {old_state}）'}
         else:
+            # 取消归档：只对仍在列表中的任务有效
             task.pop('archivedAt', None)
-        task['updatedAt'] = now_iso()
-        label = '已归档' if archived else '已取消归档'
-        result = {'ok': True, 'message': f'{task_id} {label}'}
+            task['archived'] = False
+            task['updatedAt'] = now_iso()
+            result = {'ok': True, 'message': f'{task_id} 已取消归档'}
         return tasks
 
     modify_tasks(_do_archive)

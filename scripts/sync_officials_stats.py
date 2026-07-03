@@ -209,11 +209,12 @@ def get_task_stats(org_label, tasks, alt_org=None):
     # flow_log 匹配：也用备选 org
     fl = sum(1 for t in tasks for f in t.get('flow_log',[])
              if f.get('from') in (org_label, alt_org) or f.get('to') in (org_label, alt_org))
-    # 参与的旨意（JJC）列表
+    # 参与的旨意（JJC）列表 — 只保留活跃（非终态）任务
     participated = []
     matched_ids = set()
     for t in tasks:
         if not str(t.get('id','')).startswith('JJC'): continue
+        if t.get('state') in ('Done', 'Cancelled'): continue  # 跳过已结束任务
         for f in t.get('flow_log',[]):
             if f.get('from') in (org_label, alt_org) or f.get('to') in (org_label, alt_org):
                 tid = t['id']
@@ -226,6 +227,7 @@ def get_task_stats(org_label, tasks, alt_org=None):
         agent_id = _role_to_agent(org_label)
         for t in tasks:
             if str(t.get('id','')).startswith('JJC'):
+                if t.get('state') in ('Done', 'Cancelled'): continue  # 跳过已结束任务
                 sid = t.get('sourceMeta',{}).get('agentId','')
                 if sid and sid == agent_id:
                     tid = t['id']
