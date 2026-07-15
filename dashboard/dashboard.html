@@ -709,6 +709,8 @@
     <div class="tab" data-tab="memorials">📜 奏折阁 <span class="tbadge" id="tb-mem">0</span></div>
     <div class="tab" data-tab="templates">📜 旨库</div>
     <div class="tab" data-tab="morning">📰 天下要闻</div>
+    <div class="tab" data-tab="sessions-mapping">🔗 会话映射</div>
+    <div class="tab" data-tab="system-health">🩺 系统状态</div>
   </div>
 
   <!-- ══ 旨意看板 ══ -->
@@ -750,7 +752,7 @@
 
   <!-- ══ 模型配置 ══ -->
   <div class="panel" id="panel-models">
-    <div class="sec-title" style="margin-bottom:14px">各省部 · 模型配置 <span style="font-weight:400;text-transform:none;letter-spacing:0;font-size:11px;color:var(--muted)">— 更改后自动重启 Gateway（约5秒）</span></div>
+    <div class="sec-title" style="margin-bottom:14px">各省部 · 模型配置 <span style="font-weight:400;text-transform:none;letter-spacing:0;font-size:11px;color:var(--muted)">— 更改后自动生效（热加载，无需重启）</span></div>
     <div class="model-grid" id="model-grid"></div>
     <div class="cl-wrap"><div class="cl-title">变更记录</div><div id="cl-list"></div></div>
   </div>
@@ -883,6 +885,20 @@
     </div>
 
     <div id="mb-body"></div>
+  </div>
+
+  <!-- ══ 会话映射 ══ -->
+  <div class="panel" id="panel-sessions-mapping">
+    <div class="sec-title" style="margin-bottom:14px">🔗 会话映射 · 任务与子 Agent Session 关联</div>
+    <div id="sessions-mapping-loading" style="text-align:center;padding:40px;color:var(--muted);font-size:13px">⏳ 加载中…</div>
+    <div id="sessions-mapping-content"></div>
+  </div>
+
+  <!-- ══ 系统状态 ══ -->
+  <div class="panel" id="panel-system-health">
+    <div class="sec-title" style="margin-bottom:14px">🩺 系统健康状态</div>
+    <div id="system-health-loading" style="text-align:center;padding:40px;color:var(--muted);font-size:13px">⏳ 加载中…</div>
+    <div id="system-health-content"></div>
   </div>
 </div>
 
@@ -1911,7 +1927,7 @@ async function applyModel(id){
   const s=document.getElementById('sel-'+id),b=document.getElementById('btn-'+id),st=document.getElementById('mcs-'+id);
   if(!s||!b)return;b.disabled=true;st.className='mc-st pending';st.textContent='⟳ 提交中…';
   try{const r=await postJ(API+'/set-model',{agentId:id,model:s.value});
-    if(r.ok){st.className='mc-st ok';st.textContent='✅ 已提交，Gateway 重启中（约5秒）';toast(id+'模型已更改','ok');setTimeout(()=>loadAgentConfig(),5500)}
+    if(r.ok){st.className='mc-st ok';st.textContent='✅ 模型已生效（热加载）';toast(id+'模型已更改','ok');setTimeout(()=>loadAgentConfig(),2000)}
     else{st.className='mc-st err';st.textContent='❌ '+( r.error||'错误');b.disabled=false}
   }catch(e){st.className='mc-st err';st.textContent='❌ 无法连接服务器';b.disabled=false}
 }
@@ -2086,6 +2102,8 @@ async function loadAll(){
   if(activeTab==='memorials')renderMemorials();
   if(activeTab==='templates')renderTemplates();
   if(activeTab==='morning' && !_newsPolling) loadMorning();
+  if(activeTab==='sessions-mapping') loadSessionsMapping();
+  if(activeTab==='system-health') loadSystemHealth();
 }
 
 /* ══ SESSIONS / 小任务 ══ */
@@ -2305,6 +2323,136 @@ function filterSessions(filter, el){
   document.querySelectorAll('.sess-filter').forEach(x=>x.classList.remove('active'));
   if(el) el.classList.add('active');
   renderSessions(liveStatus?liveStatus.tasks:[]);
+}
+
+/* ══ 会话映射 ══ */
+let _sessionsMappingData = null;
+let _sessionsMappingLoading = false;
+
+async function loadSessionsMapping(){
+  if(_sessionsMappingLoading) return;
+  _sessionsMappingLoading = true;
+  document.getElementById('sessions-mapping-loading').style.display = 'block';
+  document.getElementById('sessions-mapping-content').innerHTML = '';
+  try{
+    _sessionsMappingData = await fetchJ(API+'/sessions-mapping');
+    renderSessionsMapping(_sessionsMappingData);
+  }catch(e){
+    document.getElementById('sessions-mapping-content').innerHTML =
+      '<div class="empty" style="grid-column:1/-1">⚠️ 无法获取会话映射：' + esc(e.message) + '</div>';
+  }finally{
+    _sessionsMappingLoading = false;
+    document.getElementById('sessions-mapping-loading').style.display = 'none';
+  }
+}
+
+function renderSessionsMapping(data){
+  if(!data || !data.ok){
+    document.getElementById('sessions-mapping-content').innerHTML =
+      '<div class="empty">⚠️ 数据加载失败' + (data && data.error ? '：' + esc(data.error) : '') + '</div>';
+    return;
+  }
+  const tasks = data.tasks || [];
+  const totalSessions = data.totalSessions || 0;
+  if(!tasks.length){
+    document.getElementById('sessions-mapping-content').innerHTML =
+      '<div class="empty">暂无任务 Session 映射<br><small style="font-size:11px;margin-top:6px;display:block;color:var(--muted)">共 ' + totalSessions + ' 个总 Session，无匹配任务关联</small></div>';
+    return;
+  }
+  const total = tasks.reduce((s,t) => s + (t.sessions||[]).length, 0);
+  let html = '<div style="font-size:11px;color:var(--muted);margin-bottom:14px">共 ' + tasks.length + ' 个任务关联 ' + total + ' 个 Session（总 Session: ' + totalSessions + '）</div>';
+  html += '<div class="edict-grid" style="grid-template-columns:repeat(auto-fill,minmax(380px,1fr))">';
+  for(const t of tasks){
+    const sessions = t.sessions || [];
+    const stateCls = 'st-' + (t.state||'');
+    html += '<div class="edict-card" style="cursor:default">';
+    html += '<div class="ec-id">' + esc(t.id) + '</div>';
+    html += '<div class="ec-title" style="font-size:14px;margin-bottom:8px">' + esc(t.title) + '</div>';
+    html += '<div style="display:flex;gap:6px;align-items:center;margin-bottom:10px">';
+    html += '<span class="tag ' + stateCls + '">' + esc(t.state||'?') + '</span>';
+    html += '<span style="font-size:11px;color:var(--muted)">' + sessions.length + ' 个 Session</span>';
+    html += '</div>';
+    html += '<div style="display:flex;flex-direction:column;gap:4px">';
+    for(const s of sessions){
+      const statusCls = s.status === 'done' || s.status === 'completed' ? 'ok' :
+        s.status === 'running' || s.status === 'active' ? 'warn' : 'err';
+      const statusIcon = s.status === 'done' || s.status === 'completed' ? '✅' :
+        s.status === 'running' || s.status === 'active' ? '🔄' :
+        s.status === 'timeout' ? '⏰' : '❓';
+      const timeStr = s.updatedAt ? (s.updatedAt.substring(11,19) || s.updatedAt) : '-';
+      html += '<div style="display:flex;align-items:center;gap:8px;padding:6px 8px;background:var(--panel2);border-radius:7px;font-size:12px">';
+      html += '<span style="flex-shrink:0">' + statusIcon + '</span>';
+      html += '<span style="font-weight:600;min-width:80px">' + esc(s.label || s.agentId || s.key) + '</span>';
+      html += '<span class="hb ' + statusCls + '" style="font-size:10px">' + esc(s.status) + '</span>';
+      html += '<span style="font-size:10px;color:var(--muted);margin-left:auto">' + esc(timeStr) + '</span>';
+      html += '</div>';
+    }
+    html += '</div></div>';
+  }
+  html += '</div>';
+  document.getElementById('sessions-mapping-content').innerHTML = html;
+}
+
+/* ══ 系统健康 ══ */
+let _systemHealthInterval = null;
+
+async function loadSystemHealth(){
+  // 设置自动刷新（30秒间隔）
+  if(_systemHealthInterval) clearInterval(_systemHealthInterval);
+  _systemHealthInterval = setInterval(async () => {
+    if(activeTab === 'system-health'){
+      try{
+        const data = await fetchJ(API+'/system-health');
+        renderSystemHealth(data);
+      }catch(e){ /* silent refresh */ }
+    }
+  }, 30000);
+
+  document.getElementById('system-health-loading').style.display = 'block';
+  try{
+    const data = await fetchJ(API+'/system-health');
+    renderSystemHealth(data);
+  }catch(e){
+    document.getElementById('system-health-content').innerHTML =
+      '<div class="empty">⚠️ 无法获取系统状态：' + esc(e.message) + '</div>';
+  }finally{
+    document.getElementById('system-health-loading').style.display = 'none';
+  }
+}
+
+function renderSystemHealth(data){
+  if(!data){
+    document.getElementById('system-health-content').innerHTML = '<div class="empty">⚠️ 数据为空</div>';
+    return;
+  }
+
+  // 状态灯辅助
+  function statusDot(st) {
+    if(st === 'ok') return '<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--ok);box-shadow:0 0 6px #2ecc8a88;margin-right:6px"></span>';
+    if(st === 'degraded') return '<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--warn);box-shadow:0 0 6px #f5c84288;margin-right:6px"></span>';
+    return '<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--danger);box-shadow:0 0 6px #ff527088;margin-right:6px"></span>';
+  }
+
+  let html = '<div class="as-panel">';
+  html += '<div class="as-header"><span class="as-title">📦 版本信息</span></div>';
+  html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px">';
+  html += '<div class="m-row"><div class="mr-label">OpenClaw 版本</div><div class="mr-val">' + esc(data.openclaw_version||'unknown') + '</div></div>';
+  html += '<div class="m-row"><div class="mr-label">Node.js 版本</div><div class="mr-val">' + esc(data.node_version||'unknown') + '</div></div>';
+  html += '</div>';
+
+  html += '<div class="as-header" style="margin-top:18px"><span class="as-title">🔌 服务健康状态</span></div>';
+  html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">';
+  html += '<div class="m-row"><div class="mr-label">Gateway</div>';
+  html += '<div class="mr-val" style="display:flex;align-items:center;gap:6px">' + statusDot(data.gateway_status) + esc(data.gateway_status) + '</div></div>';
+  html += '<div class="m-row"><div class="mr-label">Dashboard</div>';
+  html += '<div class="mr-val" style="display:flex;align-items:center;gap:6px">' + statusDot(data.dashboard_status) + esc(data.dashboard_status) + '</div></div>';
+  html += '</div>';
+
+  html += '<div style="font-size:11px;color:var(--muted);margin-top:16px;padding-top:10px;border-top:1px solid var(--line)">';
+  html += '🕐 检测时间: ' + esc((data.timestamp||'').substring(0,19) || '-') + '</div>';
+  html += '</div>';
+
+  document.getElementById('system-health-content').innerHTML = html;
 }
 
 /* ══ MORNING BRIEF (天下要闻) ══ */
@@ -2969,6 +3117,8 @@ document.querySelectorAll('.tab').forEach(t=>t.addEventListener('click',()=>{
   if(activeTab==='sessions')renderSessions(liveStatus?liveStatus.tasks:[]);
   if(activeTab==='memorials')renderMemorials();
   if(activeTab==='templates')renderTemplates();
+  if(activeTab==='sessions-mapping')loadSessionsMapping();
+  if(activeTab==='system-health')loadSystemHealth();
 }));
 
 /* ══ COUNTDOWN (5s) ══ */

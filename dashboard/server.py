@@ -1106,6 +1106,194 @@ def _scan_actual_agent_ids():
     return result
 
 
+_SESSIONS_CACHE = {}
+_SESSIONS_CACHE_TTL = 2.0
+
+def _get_sessions_cache():
+    entry = _SESSIONS_CACHE.get('sessions_mapping')
+    if entry and (datetime.datetime.now() - entry['ts']).total_seconds() < _SESSIONS_CACHE_TTL:
+        return entry['value']
+    return None
+
+def _set_sessions_cache(value):
+    _SESSIONS_CACHE['sessions_mapping'] = {'value': value, 'ts': datetime.datetime.now()}
+
+
+def get_sessions_mapping():
+    """获取任务→Session 映射。
+    调用 openclaw sessions list 命令获取 session 列表，
+    结合 tasks_source.json 的任务列表，建立映射关系。
+    """
+    cached = _get_sessions_cache()
+    if cached is not None:
+        return cached
+
+    # 1. 获取 session 列表
+    sessions = []
+    try:
+        r = subprocess.run(
+            ['openclaw', 'sessions', 'list', '--all-agents', '--json', '--limit', '50'],
+            capture_output=True, text=True, timeout=30
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            data = json.loads(r.stdout)
+            if isinstance(data, list):
+                sessions = data
+            elif isinstance(data, dict):
+                sessions = data.get('sessions', data.get('data', []))
+    except Exception as e:
+        log.warning(f'sessions-mapping: openclaw sessions list 失败: {e}')
+        return {'ok': False, 'error': str(e)[:200]}
+
+    # 2. 加载任务列表
+    tasks = load_tasks()
+
+    # 3. 建立映射
+    # 看板任务 org 是省份名（中书省/门下省/尚书省），session 的 agentId 是 agent id（guihua/shenyi/ld-r）
+    # 通过 registry.json 建立 courtId→agentId 映射
+    court_to_agents = {}  # courtId -> [agentId]
+    agent_to_court = {}  # agentId -> courtId
+    try:
+        reg_path = pathlib.Path(__file__).parent.parent / 'registry.json'
+        if reg_path.exists():
+            registry = _cache_read_json(reg_path, [])
+            for entry in registry:
+                cid = entry.get('courtId', '')
+                aid = entry.get('id', '')
+                if cid and aid:
+                    court_to_agents.setdefault(cid, []).append(aid)
+                    # 同时用中文名 courtTitle 做映射
+                    ct = entry.get('courtTitle', '')
+                    if ct:
+                        court_to_agents.setdefault(ct, []).append(aid)
+                    agent_to_court[aid] = cid
+    except Exception as e:
+        log.warning(f'sessions-mapping: 读取 registry 失败: {e}')
+
+    task_map = {}
+    for t in tasks:
+        tid = t.get('id', '')
+        if not tid:
+            continue
+        task_map[tid] = {
+            'id': tid,
+            'title': t.get('title', ''),
+            'state': t.get('state', ''),
+            'sessions': []
+        }
+
+    # 对每个 session，尝试关联到 task
+    for s in sessions:
+        sid = s.get('key', s.get('id', s.get('sessionKey', '')))
+        agent_id = s.get('agentId', '')
+        label = s.get('label', '')
+        display_name = s.get('displayName', '')
+        status = s.get('status', s.get('state', 'unknown'))
+        updated_at = s.get('updatedAt', s.get('lastActivity', ''))
+        spawned_by = s.get('spawnedBy', '')
+        parent_key = s.get('parentSessionKey', '')
+        title = s.get('title', '')
+
+        # 用 spawnedBy、parentSessionKey、org/agentId 做关联
+        # 1. org 是省份名（中书省/门下省/尚书省）→ 通过 court_to_agents 转为 agent id 列表
+        # 2. spawnedBy/parentSessionKey 包含 agent_id
+        # 3. label/displayName 包含任务 id
+        matched_task = None
+        for tid, tinfo in task_map.items():
+            task = next((t for t in tasks if t.get('id') == tid), None)
+            if not task:
+                continue
+            task_org = task.get('org', '')
+            # org→agent ids 映射：如果 session 的 agentId 在任务省份的 agent 列表中
+            if task_org and agent_id and court_to_agents.get(task_org):
+                if agent_id in court_to_agents[task_org]:
+                    matched_task = tid
+                    break
+            # spawnedBy 匹配省份中的某个 agent
+            if task_org and spawned_by and court_to_agents.get(task_org):
+                if spawned_by in court_to_agents[task_org]:
+                    matched_task = tid
+                    break
+            # session label 包含 task id
+            if tid in label or tid in display_name or tid in (title or ''):
+                matched_task = tid
+                break
+
+        if not matched_task:
+            continue
+
+        session_info = {
+            'key': sid,
+            'agentId': agent_id,
+            'label': label or display_name or '',
+            'status': status,
+            'updatedAt': updated_at,
+            'spawnedBy': spawned_by,
+            'parentSessionKey': parent_key,
+        }
+        task_map[matched_task]['sessions'].append(session_info)
+
+    # 4. 构建返回结果
+    result_tasks = [tinfo for tinfo in task_map.values() if tinfo['sessions']]
+    result = {'ok': True, 'tasks': result_tasks, 'totalSessions': len(sessions)}
+
+    _set_sessions_cache(result)
+    return result
+
+
+def get_system_health():
+    """获取系统健康状态。
+    返回 OpenClaw 版本、Node.js 版本、Gateway 状态、Dashboard 状态。
+    """
+    result = {
+        'openclaw_version': 'unknown',
+        'node_version': 'unknown',
+        'gateway_status': 'unknown',
+        'dashboard_status': 'unknown',
+        'timestamp': now_iso(),
+    }
+
+    # OpenClaw 版本
+    try:
+        r = subprocess.run(['openclaw', '--version'], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            result['openclaw_version'] = r.stdout.strip() or r.stderr.strip() or 'unknown'
+    except Exception as e:
+        log.warning(f'system-health: openclaw --version 失败: {e}')
+
+    # Node.js 版本
+    try:
+        r = subprocess.run(['node', '-v'], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            result['node_version'] = r.stdout.strip() or 'unknown'
+    except Exception as e:
+        log.warning(f'system-health: node -v 失败: {e}')
+
+    # Gateway 健康
+    try:
+        req = Request('http://127.0.0.1:18789/healthz', method='GET')
+        resp = urlopen(req, timeout=5)
+        if resp.status == 200:
+            result['gateway_status'] = 'ok'
+        else:
+            result['gateway_status'] = 'degraded'
+    except Exception:
+        result['gateway_status'] = 'unreachable'
+
+    # Dashboard 自身健康
+    try:
+        req = Request('http://127.0.0.1:7891/healthz', method='GET')
+        resp = urlopen(req, timeout=5)
+        if resp.status == 200:
+            result['dashboard_status'] = 'ok'
+        else:
+            result['dashboard_status'] = 'degraded'
+    except Exception:
+        result['dashboard_status'] = 'unreachable'
+
+    return result
+
+
 def get_agents_status():
     """获取所有 Agent 的在线状态。
     返回各 Agent 的:
@@ -3272,6 +3460,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({'ok': False, 'error': 'invalid agent_id'}, 400)
             else:
                 self.send_json({'ok': True, 'agentId': agent_id, 'activity': get_agent_activity(agent_id)})
+        # ── 会话映射 ──
+        elif p == '/api/sessions-mapping':
+            self.send_json(get_sessions_mapping())
+        # ── 系统健康 ──
+        elif p == '/api/system-health':
+            self.send_json(get_system_health())
         # ── 朝堂议政 ──
         elif p == '/api/court-discuss/list':
             self.send_json({'ok': True, 'sessions': cd_list()})
