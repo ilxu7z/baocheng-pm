@@ -86,9 +86,9 @@ type AgentInfo = {
 
 type GlobalSkillInfo = {
   name: string;
-  description: string;
+  description?: string;
   path: string;
-  isGlobal: boolean;
+  isGlobal?: boolean;
 };
 
 export default function SkillsConfig() {

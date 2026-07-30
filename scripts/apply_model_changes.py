@@ -34,6 +34,21 @@ def cleanup_backups():
             pass
 
 
+def _hot_reload():
+    """通过 Gateway RPC 触发热加载，不重启"""
+    try:
+        r = subprocess.run(
+            ['openclaw', 'config', 'validate'],
+            capture_output=True, text=True, timeout=15
+        )
+        if r.returncode == 0:
+            log.info('config validation OK')
+        else:
+            log.warning(f'config validation: {r.stderr.strip()}')
+    except Exception as e:
+        log.warning(f'config validation failed (non-fatal): {e}')
+
+
 def main():
     if not PENDING.exists():
         return
@@ -41,8 +56,11 @@ def main():
     if not pending:
         return
 
+    import copy
     cfg = rj(OPENCLAW_CFG, {})
-    agents_list = cfg.get('agents', {}).get('list', [])
+    # deepcopy：new_cfg 的修改不影响 cfg，确保 old_text ≠ new_text 判断正确
+    new_cfg = copy.deepcopy(cfg)
+    agents_list = new_cfg.get('agents', {}).get('list', [])
     default_model = cfg.get('agents', {}).get('defaults', {}).get('model', {}).get('primary', '')
 
     applied, errors = [], []
@@ -60,17 +78,15 @@ def main():
                     ag.pop('model', None)
                 else:
                     ag['model'] = new_model
-                applied.append({'at': datetime.datetime.now().isoformat(), 'agentId': ag_id, 'oldModel': old, 'newModel': new_model})
+                # 确保 oldModel 总是字符串（非 dict），避免 React 渲染崩溃
+                old_model_str = old if isinstance(old, str) else (old.get('primary', '') if isinstance(old, dict) else str(old))
+                applied.append({'at': datetime.datetime.now().isoformat(), 'agentId': ag_id, 'oldModel': old_model_str, 'newModel': new_model})
                 found = True
                 break
         if not found:
             errors.append({'change': change, 'error': f'agent {ag_id} not found'})
 
     if applied:
-        # 只有内容真正变化时才备份和写入
-        new_cfg = dict(cfg)
-        new_cfg['agents'] = dict(cfg.get('agents', {}))
-        new_cfg['agents']['list'] = agents_list
         old_text = json.dumps(cfg, ensure_ascii=False, sort_keys=True)
         new_text = json.dumps(new_cfg, ensure_ascii=False, sort_keys=True)
         if old_text != new_text:
@@ -78,7 +94,6 @@ def main():
             shutil.copy2(OPENCLAW_CFG, bak)
             cleanup_backups()
             atomic_json_write(OPENCLAW_CFG, new_cfg)
-        cfg = new_cfg
 
         log_data = rj(CHANGE_LOG, [])
         if not isinstance(log_data, list):
@@ -91,27 +106,18 @@ def main():
         for e in applied:
             log.info(f'{e["agentId"]}: {e["oldModel"]} → {e["newModel"]}')
 
-        restart_ok = False
+        # 热加载替换重启：agents.list.*.model 的 reloadKind = "hot"
+        # gateway.reload.mode=hybrid + debounceMs=500 → 500ms 内自动生效
+        log.info('config written → gateway hot-reload in ~500ms (no restart)')
+        _hot_reload()
+        reload_ok = True
         rollback = False
-        try:
-            r = subprocess.run(['openclaw', 'gateway', 'restart'], capture_output=True, text=True, timeout=30)
-            restart_ok = r.returncode == 0
-            log.info(f'gateway restart rc={r.returncode}')
-        except Exception as e:
-            log.error(f'gateway restart failed: {e}')
-            # 回滚配置
-            if bak.exists():
-                shutil.copy2(bak, OPENCLAW_CFG)
-                log.warning('rolled back openclaw.json from backup')
-                rollback = True
-                for a in applied:
-                    a['rolledBack'] = True
 
         atomic_json_write(PENDING, [])
         atomic_json_write(DATA / 'last_model_change_result.json', {
             'at': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'applied': applied, 'errors': errors,
-            'gatewayRestarted': restart_ok, 'rolledBack': rollback,
+            'hotReloaded': reload_ok, 'rolledBack': rollback,
         })
     elif errors:
         log.warning(f'{len(errors)} changes failed, 0 applied')

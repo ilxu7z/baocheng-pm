@@ -77,7 +77,7 @@ export default function ModelConfig() {
     try {
       const r = await api.setModel(agentId, model);
       if (r.ok) {
-        setStatusMap((p) => ({ ...p, [agentId]: { cls: 'ok', text: '✅ 已提交，Gateway 重启中（约5秒）' } }));
+        setStatusMap((p) => ({ ...p, [agentId]: { cls: 'ok', text: '✅ 模型已生效（热加载）' } }));
         toast(agentId + ' 模型已更改', 'ok');
         setTimeout(() => loadAgentConfig(), 5500);
       } else {
@@ -170,7 +170,7 @@ export default function ModelConfig() {
                   <span className="cl-t">{(e.at || '').substring(0, 16).replace('T', ' ')}</span>
                   <span className="cl-a">{e.agentId}</span>
                   <span className="cl-c">
-                    <b>{e.oldModel}</b> → <b>{e.newModel}</b>
+                    <b>{String(e.oldModel ?? '')}</b> → <b>{String(e.newModel ?? '')}</b>
                     {e.rolledBack && (
                       <span
                         style={{

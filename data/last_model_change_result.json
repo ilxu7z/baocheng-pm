@@ -1,0 +1,14 @@
+{
+  "at": "2026-07-14 14:50:19",
+  "applied": [
+    {
+      "at": "2026-07-14T14:50:16.736892",
+      "agentId": "shencha",
+      "oldModel": "火山/deepseek-v4-flash-260425",
+      "newModel": "火山/deepseek-v4-flash-260425"
+    }
+  ],
+  "errors": [],
+  "hotReloaded": true,
+  "rolledBack": false
+}

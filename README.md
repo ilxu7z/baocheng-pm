@@ -83,6 +83,111 @@ open http://127.0.0.1:7891
 - ✅ 初始化 Dashboard 数据文件
 - ✅ 配置 exec 超时保护（600 秒熔断）
 
+### 🔄 升级模式（`--mode update`）
+
+如果已经安装过，使用升级模式进行增量更新：
+
+```bash
+./install.sh --mode update
+# 或简写
+./install.sh update
+```
+
+升级模式自动完成：
+- ✅ 版本比对（读取文件头部 `<!-- version:MAJOR.MINOR.PATCH -->` 标记）
+- ✅ **MAJOR 变更** → 备份后覆盖（文件结构不兼容）
+- ✅ **MINOR/PATCH 变更** → 增量追加（逐段比对，不重复写入）
+- ✅ **版本相同** → 跳过，不做任何操作
+- ✅ 大文件（>5MB）跳过，提示手动处理
+- ✅ 非 UTF-8 编码文件跳过增量追加，避免乱码
+- ✅ 无需重新注册 Agent 或重建 workspace
+
+## 🗑️ 卸载
+
+```bash
+# 清理子 Agent workspace（保留 main）
+./uninstall.sh --mode clean
+
+# 清理所有 Agent workspace（含 main）
+./uninstall.sh --mode clean-all
+
+# 清理 deprecated 标记段落（默认模式）
+./uninstall.sh --mode clean-update
+
+# 完全卸载所有 Agent 注册 + 文件
+./uninstall.sh --mode uninstall
+
+# 自动确认（跳过确认提示）
+./uninstall.sh --mode uninstall --yes
+```
+
+| 模式 | 说明 |
+|------|------|
+| `clean` | 清理子 Agent workspace 目录，保留 main 配置 |
+| `clean-all` | 清理所有 Agent 的 workspace（含 main） |
+| `clean-update` | 清理文件中带有 `deprecated` 标记的段落（默认），备份保存为 `*.bak.clean-*` |
+| `uninstall` | 完全卸载：删除 Agent 注册、配置文件、workspace 目录，恢复环境 |
+
+> ⚠️ 卸载前会自动备份 `openclaw.json` 到 `*.bak.pre-uninstall-*`，方便回滚。
+
+## 📦 版本升级策略
+
+系统采用 **版本标记协议** 实现智能升级，每个受管文件头部包含 HTML 注释格式的版本标记：
+
+```html
+<!-- version:v2.0.0-system -->
+```
+
+### 版本比较规则
+
+| 版本变更 | 策略 | 说明 |
+|---------|------|------|
+| 目标不存在 | 创建 | 直接复制 |
+| MAJOR 变更 | 覆盖 | 备份 `*.bak.YYYYMMDD-HHMMSS` 后覆盖 |
+| MINOR/PATCH 变更 | 增量追加 | 逐段比对，只追加新内容 |
+| 版本相同 | 跳过 | 不操作 |
+
+### 增量追加算法
+
+`append_incremental()` 函数实现智能追加：
+
+1. 读取目标文件全部内容到内存
+2. 逐段比对源文件段落（以空行分隔）
+3. 只追加目标文件中**不存在**的段落
+4. 大文件模式（>1MB）使用 grep 批量预检，不加载全量
+5. 编码检测：`file -I` 识别非 UTF-8/US-ASCII 文件，跳过追加
+
+> 升级前自动创建备份文件，支持回滚。
+
+## 🔍 OCR 集成
+
+OCR（OpenClaw + Crestodian + RAG）融合系统为三省六部制提供 SDD/CDD 方案支持，实现一键安装升级。
+
+### 安装与验证
+
+安装脚本自动安装 OCR CLI：
+
+```bash
+# 验证 OCR 版本
+ocr --version
+
+# 如果版本低于 1.8.0，install.sh 自动升级
+```
+
+### 规则文件
+
+OCR 规则文件位于 `.github/ocr-rules.md`，包含：
+
+- **版本协议**：文件头部 `<!-- version:MAJOR.MINOR.PATCH-system -->` 标记
+- **写入策略**：MAJOR 覆盖 / MINOR 增量追加 / 版本相同跳过
+- **大文件处理**：>5MB 提示手动处理，>1MB≤5MB grep 预检
+- **编码检测**：`file -I` 检测，非 UTF-8 跳过
+- **备份规则**：覆盖/增量追加前自动创建备份文件
+
+此规则文件同时被 GitHub Actions 工作流引用，确保 CI/CD 流程中的版本一致性。
+
+---
+
 ## 📋 看板 Dashboard
 
 启动后访问 `http://127.0.0.1:7891`，提供：

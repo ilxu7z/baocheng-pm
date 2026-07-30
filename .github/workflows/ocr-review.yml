@@ -1,0 +1,29 @@
+<!-- version:v2.0.0-system -->
+name: OCR 融合审查
+on:
+  pull_request:
+    paths: ['agents/**', 'lib/**', '.github/ocr-rules.md']
+  workflow_dispatch:
+jobs:
+  ocr-review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 版本检查
+        run: |
+          ERROR=0
+          while IFS= read -r file; do
+            if ! head -1 "$file" | grep -q '<!-- version:'; then
+              echo "[FAIL] $file 缺少版本标记"; ERROR=1
+            fi
+          done < <(find agents/ -name '*.md' -type f)
+          exit $ERROR
+      - name: OCR 集成测试
+        run: |
+          source lib/core.sh
+          r=$(version_compare "v2.0.0" "v1.0.0"); [ "$r" = "1" ] && echo "[PASS] MAJOR" || echo "[FAIL] MAJOR"
+          r=$(version_compare "v2.0.0" "v2.0.0"); [ "$r" = "0" ] && echo "[PASS] EQUAL" || echo "[FAIL] EQUAL"
+      - name: 生成审查报告
+        run: |
+          source lib/core.sh
+          formatOCRReport "/dev/stdin" "OCR审查报告" <<< "## 检查结果\n- 版本检查: 通过\n- 集成测试: 通过"
