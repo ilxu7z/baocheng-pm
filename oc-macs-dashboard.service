@@ -1,0 +1,17 @@
+[Unit]
+Description=三省六部看板 (oc-macs)
+After=openclaw-gateway.service
+BindsTo=openclaw-gateway.service
+
+[Service]
+ExecStart=/usr/bin/bash /home/chee/Projects/oc-macs/start.sh
+WorkingDirectory=/home/chee/Projects/oc-macs
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+TimeoutStartSec=30
+Environment=HOME=/home/chee
+Environment=PATH=/home/chee/.nvm/versions/node/v24.18.0/bin:/usr/local/bin:/usr/bin:/bin:/home/chee/.local/bin
+
+[Install]
+WantedBy=openclaw-gateway.service
