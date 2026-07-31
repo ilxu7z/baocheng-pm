@@ -3480,6 +3480,17 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(data if data else {'ok': False, 'error': 'session not found'}, 200 if data else 404)
         elif p == '/api/court-discuss/fate':
             self.send_json({'ok': True, 'event': cd_fate()})
+        elif p == '/api/ocr/status':
+            # open-code-review 集成状态（动态加载 ocr_bridge，避免硬依赖）
+            try:
+                import importlib.util
+                spec = importlib.util.spec_from_file_location(
+                    'ocr_bridge', str(SCRIPTS / 'ocr_bridge.py'))
+                ocr_bridge = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(ocr_bridge)
+                self.send_json(ocr_bridge.ocr_status())
+            except Exception:
+                self.send_json({'ok': False, 'error': 'ocr_bridge 不可用'}, 500)
         elif self._serve_static(p):
             pass  # 已由 _serve_static 处理 (JS/CSS/图片等)
         else:
@@ -3925,6 +3936,98 @@ class Handler(BaseHTTPRequestHandler):
             if sid:
                 cd_destroy(sid)
             self.send_json({'ok': True})
+
+        # ── open-code-review 代码审查端点 ──
+        elif p == '/api/ocr/review':
+            if not body.get('repoDir'):
+                self.send_json({'ok': False, 'error': '缺少 repoDir'}, 400)
+                return
+            try:
+                import importlib.util
+                spec = importlib.util.spec_from_file_location(
+                    'ocr_bridge', str(SCRIPTS / 'ocr_bridge.py'))
+                ocr_bridge = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(ocr_bridge)
+                result = ocr_bridge.ocr_review(
+                    body['repoDir'],
+                    body.get('rulePath'),
+                    body.get('from'),
+                    body.get('to'),
+                )
+                response = result.to_dict()
+                if body.get('taskId') and result.success:
+                    response['stored_at'] = ocr_bridge.save_ocr_result(body['taskId'], result)
+                self.send_json(response)
+            except Exception as e:
+                self.send_json({'ok': False, 'error': str(e)}, 500)
+
+        elif p == '/api/ocr/scan':
+            if not body.get('repoDir'):
+                self.send_json({'ok': False, 'error': '缺少 repoDir'}, 400)
+                return
+            try:
+                import importlib.util
+                spec = importlib.util.spec_from_file_location(
+                    'ocr_bridge', str(SCRIPTS / 'ocr_bridge.py'))
+                ocr_bridge = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(ocr_bridge)
+                result = ocr_bridge.ocr_scan(
+                    body['repoDir'],
+                    body.get('rulePath'),
+                    body.get('paths'),
+                )
+                response = result.to_dict()
+                if body.get('taskId') and result.success:
+                    response['stored_at'] = ocr_bridge.save_ocr_result(body['taskId'], result)
+                self.send_json(response)
+            except Exception as e:
+                self.send_json({'ok': False, 'error': str(e)}, 500)
+
+        elif p == '/api/ocr/resume':
+            if not body.get('repoDir') or not body.get('sessionId'):
+                self.send_json({'ok': False, 'error': '缺少 repoDir 或 sessionId'}, 400)
+                return
+            try:
+                import importlib.util
+                spec = importlib.util.spec_from_file_location(
+                    'ocr_bridge', str(SCRIPTS / 'ocr_bridge.py'))
+                ocr_bridge = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(ocr_bridge)
+                result = ocr_bridge.ocr_resume(
+                    body['sessionId'],
+                    body['repoDir'],
+                    body.get('rulePath'),
+                )
+                response = result.to_dict()
+                if body.get('taskId') and result.success:
+                    response['stored_at'] = ocr_bridge.save_ocr_result(body['taskId'], result)
+                self.send_json(response)
+            except Exception as e:
+                self.send_json({'ok': False, 'error': str(e)}, 500)
+
+        elif p == '/api/ocr/results':
+            try:
+                results_dir = BASE.parent / 'data' / 'ocr_results'
+                if not results_dir.exists():
+                    self.send_json({'results': []})
+                    return
+                task_id = body.get('taskId', '')
+                session_id = body.get('sessionId', '')
+                matching = []
+                for fname in results_dir.iterdir():
+                    if not fname.name.endswith('.json') or fname.name.endswith('.tmp'):
+                        continue
+                    if task_id and not fname.name.startswith(task_id):
+                        continue
+                    if session_id and session_id[:8] not in fname.name:
+                        continue
+                    try:
+                        matching.append(json.loads(fname.read_text(encoding='utf-8')))
+                    except Exception:
+                        continue
+                self.send_json({'results': matching})
+            except Exception as e:
+                self.send_json({'ok': False, 'error': str(e)}, 500)
 
         else:
             self.send_error(404)

@@ -44,3 +44,4 @@ data/shared_memory.json
 data/task_memory/
 plans/
 scripts/memos-embed-repair.js
+data/ocr_results/
