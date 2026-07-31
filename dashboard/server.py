@@ -3247,6 +3247,37 @@ def handle_advance_state(task_id, comment=''):
         _scheduler_mark_progress(task, f'手动推进 {cur} -> {next_state}')
         task['updatedAt'] = now_iso()
 
+        # 🔥 OCR 自动审查：锋铸完成 → 审查 → critical/high 自动建 P0 任务
+        # 同步版，后续可改线程池（不阻塞推进响应，但审查耗时写入 task['ocr_auto']）
+        if next_state == 'Review':
+            try:
+                import importlib.util
+                spec = importlib.util.spec_from_file_location(
+                    "ocr_auto_trigger",
+                    os.path.join(str(SCRIPTS), "ocr_auto_trigger.py"),
+                )
+                ocat = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(ocat)
+                repo_dir = task.get('repo_dir') or str(BASE.parent)
+                trigger_result = ocat.auto_review_and_create_tasks(
+                    task_id, repo_dir
+                )
+                if trigger_result.get('tasks_created'):
+                    task.setdefault('ocr_auto', {})
+                    task['ocr_auto']['triggered'] = True
+                    task['ocr_auto']['created'] = trigger_result['tasks_created']
+                    task.setdefault('flow_log', []).append({
+                        'at': now_iso(),
+                        'from': 'OCR',
+                        'to': '缺陷',
+                        'remark': (
+                            f"OCR审查发现 {trigger_result['critical_count']}"
+                            " 个高危缺陷，已记录待创建P0任务"
+                        ),
+                    })
+            except Exception as e:
+                log.warning(f"OCR 自动审查触发失败: {e}")
+
         if next_state != 'Done':
             dispatch_needed = True
             dispatch_state = next_state
