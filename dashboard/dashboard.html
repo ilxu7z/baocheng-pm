@@ -1003,10 +1003,68 @@ async function postJ(u,d){const r=await fetch(u,{method:'POST',headers:{'Content
 function toast(msg,type='ok',ms=3000){const el=document.createElement('div');el.className=`toast ${type}`;el.textContent=msg;document.getElementById('toaster').appendChild(el);setTimeout(()=>el.remove(),ms)}
 const STATE_LABEL={Inbox:'收件',Pending:'待处理',Taizi:'总办分拣',Zhongshu:'规划起草',Menxia:'审议中',Assigned:'已派发',Doing:'执行中',Review:'待审查',Done:'已完成',Blocked:'阻塞',Cancelled:'已取消',Next:'待执行'};
 // 根据轮次动态生成状态标签
+/* ══ 六合一：SDD/CDD/迭代/老板确认 ══ */
+function renderSixUnitySection(t){
+  const spec = t.spec && typeof t.spec==='object' ? t.spec : null;
+  const cdd = t.cdd && typeof t.cdd==='object' ? t.cdd : null;
+  const it = (t.decomp_audit && t.decomp_audit.iterate) || (t.decomp_audit && t.decomp_audit.decomp) || null;
+  const score = it ? it.score_pct ?? it.final_score_pct ?? it.pass_rate : null;
+  const awaiting = t.spec_status === 'awaiting_boss';
+  const hasAny = spec || cdd || score || awaiting;
+  if(!hasAny) return '';
+
+  const sddHtml = spec ? `<div class="six-block">
+    <div class="six-label">📐 SDD 规范契约</div>
+    ${spec.purpose?`<div><b>目标</b>：${esc(spec.purpose)}</div>`:''}
+    ${Array.isArray(spec.outputs)&&spec.outputs.length?`<div><b>交付物</b>：${esc(spec.outputs.join('、'))}</div>`:''}
+    ${Array.isArray(spec.acceptance_criteria)&&spec.acceptance_criteria.length?`<div><b>验收标准</b>：</div><ol style="margin:4px 0 0 18px;font-size:12px">${spec.acceptance_criteria.slice(0,6).map(c=>`<li>${esc(c)}</li>`).join('')}</ol>`:''}
+  </div>` : '';
+
+  const cddHtml = cdd ? `<div class="six-block">
+    <div class="six-label">🤝 CDD 协作契约</div>
+    ${Array.isArray(cdd.agents)&&cdd.agents.length?`<div><b>协作方</b>：${esc(cdd.agents.map(a=>a.role||a.agent).join('、'))}</div>`:''}
+    ${Array.isArray(cdd.alignment_rules)&&cdd.alignment_rules.length?`<div><b>对齐规则</b>：</div><ul style="margin:4px 0 0 18px;font-size:12px">${cdd.alignment_rules.slice(0,6).map(r=>`<li>${esc(r)}</li>`).join('')}</ul>`:''}
+  </div>` : '';
+
+  const itHtml = score!==null ? `<div class="six-block">
+    <div class="six-label">🎯 方案落地把握</div>
+    <div style="font-size:18px;font-weight:700;color:${score>=98?'var(--ok)':'var(--danger)'}">${Number(score).toFixed(1)}%${score>=98?' ✅':' ⚠️需补齐'}</div>
+    ${it.rounds?`<div style="font-size:11px;color:var(--muted)">已迭代 ${it.rounds} 轮</div>`:''}
+  </div>` : '';
+
+  const bossHtml = awaiting ? `<div class="six-block" style="border-color:#f5a62366;background:#f5a6230c">
+    <div class="six-label">👑 老板确认闸（awaiting_boss）</div>
+    <div style="font-size:12px;color:var(--muted);margin-bottom:8px">方案已就绪（≥98%），未确认前无法推进到执行。</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn-action" style="background:#2ecc8a22;color:#2ecc8a;border:1px solid #2ecc8a44;flex:1" onclick="bossConfirm('${esc(t.id)}','approve')">✅ 老板通过</button>
+      <button class="btn-action" style="background:#ff527022;color:#ff5270;border:1px solid #ff527044;flex:1" onclick="bossConfirmPrompt('${esc(t.id)}','reject')">🚫 老板驳回</button>
+      <button class="btn-action" style="background:#7c5cfc18;color:#7c5cfc;border:1px solid #7c5cfc44;flex:1" onclick="bossConfirm('${esc(t.id)}','skip')">⏭ 豁免（方案已定）</button>
+    </div>
+  </div>` : (t.boss_review ? `<div class="six-block">
+    <div class="six-label">👑 老板确认记录</div>
+    <div style="font-size:12px">${esc(['approve','reject','skip'].includes(t.boss_review.decision)?({approve:'✅ 通过',reject:'🚫 驳回',skip:'⏭ 豁免'})[t.boss_review.decision]:t.boss_review.decision)}${t.boss_review.comment?`：${esc(t.boss_review.comment)}`:''}</div>
+  </div>` : '');
+
+  return `<div class="m-section"><div class="m-sec-label">🔀 六合一闭环（SDD/CDD/迭代/老板确认）</div><div style="display:flex;flex-direction:column;gap:8px">${sddHtml}${cddHtml}${itHtml}${bossHtml}</div></div>`;
+}
+
+async function bossConfirm(id, decision){
+  const comment = decision==='reject' ? (prompt('驳回意见（可选）：')||'') : '';
+  const r = await postJ('/api/boss-confirm',{taskId:id,decision,comment});
+  if(r&&r.ok) openTask(id); else alert((r&&r.error)||'操作失败');
+}
+async function bossConfirmPrompt(id, decision){
+  const comment = prompt('驳回意见（必填，规划部据以修订）：')||'';
+  if(!comment){ alert('驳回需填写意见'); return; }
+  const r = await postJ('/api/boss-confirm',{taskId:id,decision,comment});
+  if(r&&r.ok) openTask(id); else alert((r&&r.error)||'操作失败');
+}
+
 function stateLabel(t){
   const r = t.review_round||0;
   if(t.state==='Menxia' && r>1) return `审议中（第${r}轮）`;
   if(t.state==='Zhongshu' && r>0) return `规划修订（第${r}轮）`;
+  if(t.spec_status==='awaiting_boss') return `待老板确认`;
   return STATE_LABEL[t.state]||t.state;
 }
 
@@ -1404,6 +1462,9 @@ function openTask(id){
       <button class="btn-action" style="background:#ff527022;color:#ff5270;border:1px solid #ff527044" onclick="reviewAction('${esc(t.id)}','reject')">🚫 驳回</button>` : ''}
       ${['Pending','Taizi','Zhongshu','Menxia','Assigned','Doing','Review','Next'].includes(t.state) ? `<button class="btn-action" style="background:#7c5cfc18;color:#7c5cfc;border:1px solid #7c5cfc44" onclick="advanceState('${esc(t.id)}','${esc(t.state)}')">⏩ 推进到下一步</button>` : ''}
     </div>
+
+    <!-- 六合一：SDD/CDD 契约 + 迭代分 + 老板确认闸 -->
+    ${renderSixUnitySection(t)}
 
     <!-- 总控调度 -->
     <div class="sched-section">

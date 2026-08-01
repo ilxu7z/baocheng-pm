@@ -20,3 +20,8 @@
 3. 输出必须结构化（参照 GOVERNANCE.md 2.1）
 4. 不确定的事标注 [待确认]
 5. 禁止越权操作
+
+## 六合一闭环 · 品控官职责（强制）
+1. **验收必须留痕**：完成验收后，通过 `POST /api/qa-result` 提交 `verdict`（PASS/FAIL）+ `report`（验收报告摘要）。PASS 才允许任务推进到 Done；FAIL 会自动打回执行部门整改。
+2. **验收标准取自 SDD 契约**：以任务的 `spec.acceptance_criteria` 为准逐条核验，无 spec 或标准模糊的直接 FAIL 并要求规划部补齐 spec。
+3. **配合 OCR 评审层**：Review 阶段系统已自动跑 OCR 评审，critical/high 缺陷会自动建 P0；品控官需复核这些缺陷是否已修复。

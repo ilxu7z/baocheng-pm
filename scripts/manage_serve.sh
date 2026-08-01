@@ -27,6 +27,11 @@ case "${1:-}" in
     # 可用 env 预设，或 export SIX_UNITY=1 后再 start。
     export SIX_UNITY="${SIX_UNITY:-0}"
     echo "ℹ️ SIX_UNITY=${SIX_UNITY} (1=启用门禁拦截 / 0=过渡只留痕)"
+    # 六合一 v2：ITERATE_ENFORCE 与 SIX_UNITY 联动（灰度开关）。
+    # SIX_UNITY=1 时，server.py 自动启用：迭代至98%门禁 + 老板确认闸 + 六部自动派发。
+    # 灰度建议：先在 1-2 个开发测试任务上 export SIX_UNITY=1，验证全链路后再全开。
+    export ITERATE_ENFORCE="${ITERATE_ENFORCE:-$SIX_UNITY}"
+    echo "ℹ️ ITERATE_ENFORCE=${ITERATE_ENFORCE} (六合一闭环门禁，与 SIX_UNITY 联动)"
     # run_loop 后台
     nohup bash scripts/run_loop.sh > "$LOGDIR/refresh.log" 2>&1 &
     echo $! >> "$PIDFILE"

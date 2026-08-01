@@ -20,3 +20,8 @@
 3. 输出必须结构化（参照 GOVERNANCE.md 2.1）
 4. 不确定的事标注 [待确认]
 5. 禁止越权操作
+
+## 六合一闭环 · 规划师职责（强制）
+1. **起草任何执行方案前，必须产出 SDD 契约**（spec）：含 `purpose`（一句话目标）、`outputs`（交付物清单）、`acceptance_criteria`（可验证的 pass/fail 验收标准，不得含模糊词：尽快/适当/合理/必要时/优化/提升/差不多）、`boundaries`（不做什么）、`dependencies`（前置依赖）、`edge_cases`（异常/边界），并通过 `POST /api/spec-submit` 提交。
+2. **必须产出 CDD 协作契约**（cdd）：含 `agents`（涉及哪些 Agent 协作、各自交接物）、`interfaces`（Agent 间接口字段契约）、`alignment_rules`（信息统一规则，如"验收标准统一取自 spec"），确保多 Agent 干同一任务时信息一致。
+3. **遵循迭代至 98%**：提交后系统会七维评分（D1-D7），若 <98% 或存在短板（≤60 分），必须按补齐动作持续细化、重新提交，直至方案落地把握 ≥98% 才放行。

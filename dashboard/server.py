@@ -3015,6 +3015,82 @@ def _build_knowledge_context(task_title='', task_org='', task_project=''):
     return '\n'.join(lines)
 
 
+def _build_cdd_context(task):
+    """构建 CDD 协作约束注入文本（六合一 v2）。
+
+    从 task['cdd']（军师写的协作契约框架）提取涉及 Agent、接口契约、
+    对齐规则，注入给派发接收方，保证多 Agent 干同一任务时信息统一。
+    返回 (text, involved_agents)：text 为注入文本，involved_agents 为
+    该任务涉及的所有 Agent id 列表。
+    """
+    cdd = task.get('cdd')
+    if not isinstance(cdd, dict):
+        return '', []
+
+    lines = ['', '🤝 **CDD 协作契约（多 Agent 信息统一，务必遵守）**']
+    involved = []
+
+    agents = cdd.get('agents')
+    if isinstance(agents, list) and agents:
+        lines.append('涉及协作方：')
+        for a in agents:
+            name = a.get('role') or a.get('agent') or ''
+            dels = a.get('deliverables')
+            if a.get('agent'):
+                involved.append(a['agent'])
+            del_txt = ('：' + '、'.join(dels)) if isinstance(dels, list) and dels else ''
+            lines.append(f'  • {name}{del_txt}')
+
+    interfaces = cdd.get('interfaces')
+    if isinstance(interfaces, list) and interfaces:
+        lines.append('接口/交接契约：')
+        for itf in interfaces[:8]:
+            frm = itf.get('from', '')
+            to = itf.get('to', '')
+            contract = itf.get('contract', '')
+            must = itf.get('must_match', '')
+            seg = f'{frm}→{to}: {contract}'
+            if must:
+                seg += f'（{must}）'
+            lines.append(f'  • {seg}')
+
+    rules = cdd.get('alignment_rules')
+    if isinstance(rules, list) and rules:
+        lines.append('对齐规则：')
+        for r in rules[:8]:
+            lines.append(f'  • {r}')
+
+    return '\n'.join(lines), involved
+
+
+def _build_sdd_context(task):
+    """构建 SDD 契约摘要注入文本（六合一 v2）。
+
+    从 task['spec'] 提取 purpose/outputs/acceptance_criteria/boundaries，
+    注入派发消息，让接收 Agent 明确验收标准（防跑偏）。
+    """
+    spec = task.get('spec')
+    if not isinstance(spec, dict):
+        return ''
+
+    lines = ['', '📐 **SDD 契约（验收标准，输出必须对齐）**']
+    if spec.get('purpose'):
+        lines.append(f'目标：{spec["purpose"]}')
+    outs = spec.get('outputs')
+    if isinstance(outs, list) and outs:
+        lines.append('交付物：' + '、'.join(outs[:6]))
+    ac = spec.get('acceptance_criteria')
+    if isinstance(ac, list) and ac:
+        lines.append('验收标准：')
+        for i, c in enumerate(ac[:6], 1):
+            lines.append(f'  {i}. {c}')
+    bounds = spec.get('boundaries')
+    if isinstance(bounds, list) and bounds:
+        lines.append('范围边界（不做）：' + '、'.join(bounds[:5]))
+
+    return '\n'.join(lines)
+
+
 def _build_post_done_review_prompt(task_title='', task_org=''):
     """生成任务完成后的经验回顾提示。"""
     return (
@@ -3191,15 +3267,51 @@ def dispatch_for_state(task_id, task, new_state, trigger='state-transition'):
     )
     if skill_guidance:
         msg += '\n' + skill_guidance
-    # 🔥 CDD 注入留痕（可观测，证明注入了哪些上下文）
+    # 🔥 六合一 v2：注入 SDD 契约摘要 + CDD 协作约束（防跑偏 + 多 Agent 对齐）
+    sdd_txt = _build_sdd_context(task)
+    if sdd_txt:
+        msg += sdd_txt
+        if _SIX_UNITY_AVAILABLE and six_unity is not None:
+            try:
+                _update_task_scheduler(task_id, lambda t, s: (
+                    six_unity.cdd_record_injection(
+                        t, layer='S', knowledge_src='sdd-contract',
+                        agent=agent_id,
+                    ),
+                    None,
+                ))
+            except Exception as e:
+                log.warning(f'CDD(SDD) 注入留痕失败: {e}')
+    cdd_txt, cdd_agents = _build_cdd_context(task)
+    if cdd_txt:
+        msg += cdd_txt
+        if _SIX_UNITY_AVAILABLE and six_unity is not None:
+            try:
+                _update_task_scheduler(task_id, lambda t, s: (
+                    six_unity.cdd_record_injection(
+                        t, layer='C', knowledge_src='cdd-collab',
+                        agent=agent_id,
+                    ),
+                    None,
+                ))
+            except Exception as e:
+                log.warning(f'CDD(协作) 注入留痕失败: {e}')
+    # 🔥 CDD 注入留痕（可观测，最终版：汇总所有注入源）
     if _SIX_UNITY_AVAILABLE and six_unity is not None:
         try:
-            _injected_src = 'shared-knowledge' if knowledge else ''
+            _srcs = []
+            if knowledge:
+                _srcs.append('shared-knowledge')
             if skill_guidance:
-                _injected_src += (' + skill-guidance' if _injected_src else 'skill-guidance')
+                _srcs.append('skill-guidance')
+            if sdd_txt:
+                _srcs.append('sdd-contract')
+            if cdd_txt:
+                _srcs.append('cdd-collab')
+            _final_src = ' + '.join(_srcs) if _srcs else 'none'
             _update_task_scheduler(task_id, lambda t, s: (
                 six_unity.cdd_record_injection(
-                    t, layer='C', knowledge_src=_injected_src,
+                    t, layer='C', knowledge_src=_final_src,
                     agent=agent_id,
                 ),
                 None,
@@ -3556,15 +3668,52 @@ def handle_advance_state(task_id, comment=''):
                     return tasks
 
             # ③ 任务分解自查：Menxia → Assigned 时触发七维评分
-            if cur == 'Menxia' and next_state == 'Assigned':
-                _allow_decomp, _audit_decomp = six_unity.decomp_check(task_id, task, _append_flow)
-                if not _allow_decomp:
-                    result = {'ok': False, 'error': f'任务分解未达标({_audit_decomp.get("score_pct")}%)，转补齐'}
-                    # 标记为补齐中（复用 block 字段，不新增状态）
-                    task['block'] = '任务分解补齐中'
-                    _scheduler_mark_progress(task, f'任务分解未达标，转补齐')
+            # ⚠️ 缺陷A修复：不再在此独立驳回，统一交由下方 iterate 门禁承担。
+            #    decomp_check 与 iterate 双门禁会导致 enabled()=1 时双驳回、
+            #    block 字段被覆盖。iterate 内部已含七维评分 + gen_remediation。
+            # （保留 decomp_check 能力：iterate->selfcheck 同样走七维评分）
+            if cur == 'Menxia' and next_state == 'Assigned' and not six_unity.enabled():
+                # 过渡模式（SIX_UNITY=0）仅留痕不拦截，供审计观察
+                try:
+                    six_unity.decomp_check(task_id, task, _append_flow)
+                except Exception:
+                    pass
+
+        # ── 六合一 v2：迭代至98%门禁 + 老板确认闸（新）──
+        if six_unity is not None and six_unity.enabled():
+            try:
+                sys.path.insert(0, str(SCRIPTS))
+                import iterate_engine as _ite
+            except Exception as _e:
+                _ite = None
+
+            if _ite is not None and cur == 'Menxia' and next_state == 'Assigned':
+                # 迭代至98%：方案需达到 ≥98 且无短板才允许进入执行
+                if not _ite.is_ready(task)[0]:
+                    _it_res = _ite.iterate(task, max_rounds=3, flow_log_append=_append_flow)
+                    result = {'ok': False,
+                              'error': f'方案落地把握未达98%（评分 {_it_res["score_pct"]}%），已生成补齐动作，请规划部继续细化'}
+                    task['block'] = '方案迭代补齐中'
+                    _scheduler_mark_progress(task, f'迭代门禁: {_it_res["score_pct"]}% <98%，转补齐')
                     task['updatedAt'] = now_iso()
                     return tasks
+
+            # 老板确认闸：Assigned → Doing 前，方案必须经老板确认
+            if cur == 'Assigned' and next_state == 'Doing' and \
+                    task.get('spec_status') == 'awaiting_boss' and not task.get('boss_review'):
+                result = {'ok': False, 'error': '方案待老板确认（awaiting_boss），请先调用 /api/boss-confirm 通过或驳回'}
+                _scheduler_mark_progress(task, '老板确认闸拦截：awaiting_boss 未确认')
+                task['updatedAt'] = now_iso()
+                return tasks
+
+            # 六部自动派发：Assigned → Doing 时，把 targetDept 写回 org（若指定）
+            if cur == 'Assigned' and next_state == 'Doing':
+                _td = task.get('targetDept') or ''
+                _td_modern = ORG_MODERN.get(_td, _td) if _td else ''
+                if _td and (_td_modern in ORG_MODERN.values() or _td in ORG_MODERN.values()):
+                    task['org'] = _td_modern or _td
+                    task['now'] = f'执行办已派发至 {task["org"]}'
+                    _append_flow({'from': '执行办', 'to': task['org'], 'remark': f'自动派发至 {task["org"]}'})
 
         task['state'] = next_state
         task['now'] = f'⬇️ 手动推进：{remark}'
@@ -3612,6 +3761,149 @@ def handle_advance_state(task_id, comment=''):
             dispatch_for_state(task_id, task, dispatch_state)
 
     return result
+
+
+def _handle_spec_submit(task_id, spec=None, cdd=None):
+    """六合一 v2：规划部提交 SDD(spec) + CDD(cdd) 契约。
+
+    写入 task['spec'] / task['cdd']，触发一次迭代评分；
+    若 ≥98% 无短板则标记 spec_status='awaiting_boss'（进老板确认闸），
+    否则保留 'pending'（待补）。
+    """
+    result = {'ok': False, 'error': f'任务 {task_id} 不存在'}
+
+    def _do_submit(tasks):
+        nonlocal result
+        task = next((t for t in tasks if t.get('id') == task_id), None)
+        if not task:
+            return tasks
+        if spec is not None:
+            task['spec'] = spec
+        if cdd is not None:
+            task['cdd'] = cdd
+        task.setdefault('flow_log', []).append({
+            'at': now_iso(), 'from': '规划部', 'to': task.get('state', ''),
+            'remark': '提交 SDD+CDD 契约' + ('（含SDD）' if spec else '') + ('（含CDD）' if cdd else ''),
+        })
+        # 触发迭代评分
+        _run_iterate_score(task)
+        # SDD 契约齐全 → 进老板确认闸
+        try:
+            sys.path.insert(0, str(SCRIPTS))
+            import iterate_engine as _ite
+            ready, _ = _ite.is_ready(task)
+        except Exception:
+            ready = False
+        task['spec_status'] = 'awaiting_boss' if ready else 'pending'
+        if ready:
+            task.setdefault('flow_log', []).append({
+                'at': now_iso(), 'from': '迭代引擎', 'to': '老板确认',
+                'remark': '方案就绪（≥98%），进入老板确认闸',
+            })
+        task['updatedAt'] = now_iso()
+        result = {'ok': True, 'message': f'{task_id} 契约已提交，spec_status={task["spec_status"]}',
+                  'spec_status': task['spec_status'],
+                  'iterate': (task.get('decomp_audit') or {}).get('iterate') or {}}
+        return tasks
+
+    modify_tasks(_do_submit)
+    return result
+
+
+def _handle_boss_confirm(task_id, decision, comment=''):
+    """六合一 v2：老板确认闸。
+
+    decision:
+      approve → 老板通过，清除 awaiting_boss，可继续推进到执行
+      reject  → 老板驳回，退回规划部修订（含意见）
+      skip    → 老板明确"方案已定只让六部落地"，豁免确认直接放行
+    """
+    result = {'ok': False, 'error': f'任务 {task_id} 不存在'}
+
+    def _do_confirm(tasks):
+        nonlocal result
+        task = next((t for t in tasks if t.get('id') == task_id), None)
+        if not task:
+            return tasks
+        task.setdefault('flow_log', []).append({
+            'at': now_iso(), 'from': '老板', 'to': task.get('state', ''),
+            'remark': f'老板确认[{decision}]：{comment or "（无意见）"}',
+        })
+        if decision == 'approve':
+            task['boss_review'] = {'decision': 'approve', 'comment': comment, 'at': now_iso()}
+            task['spec_status'] = 'reviewed'
+            task['now'] = '老板已确认方案，可推进执行'
+            result = {'ok': True, 'message': f'{task_id} 老板通过，可推进执行'}
+        elif decision == 'reject':
+            task['boss_review'] = {'decision': 'reject', 'comment': comment, 'at': now_iso()}
+            task['spec_status'] = 'pending'
+            task['state'] = 'Zhongshu'  # 退回规划部
+            task['now'] = f'老板驳回，退回规划部修订：{comment or ""}'
+            task['block'] = ''
+            task.setdefault('flow_log', []).append({
+                'at': now_iso(), 'from': '老板', 'to': '规划部',
+                'remark': f'驳回退回规划部：{comment or ""}',
+            })
+            result = {'ok': True, 'message': f'{task_id} 老板驳回，退回规划部', 'state': 'Zhongshu'}
+        else:  # skip 豁免
+            task['boss_review'] = {'decision': 'skip', 'comment': comment, 'at': now_iso()}
+            task['spec_status'] = 'reviewed'
+            task['now'] = '老板豁免确认（方案已定），直接放行'
+            result = {'ok': True, 'message': f'{task_id} 老板豁免确认，放行执行'}
+        task['updatedAt'] = now_iso()
+        return tasks
+
+    modify_tasks(_do_confirm)
+    return result
+
+
+def _handle_qa_result(task_id, verdict, report=''):
+    """六合一 v2：品控验收提交。
+
+    PASS → 允许推进到 Done；FAIL → 自动打回对应执行部门（写 flow_log）。
+    """
+    result = {'ok': False, 'error': f'任务 {task_id} 不存在'}
+
+    def _do_qa(tasks):
+        nonlocal result
+        task = next((t for t in tasks if t.get('id') == task_id), None)
+        if not task:
+            return tasks
+        task.setdefault('flow_log', []).append({
+            'at': now_iso(), 'from': '品控官', 'to': task.get('state', ''),
+            'remark': f'品控验收[{verdict}]：{report or "（无报告）"}',
+        })
+        task['qa'] = {'verdict': verdict, 'report': report, 'at': now_iso()}
+        if verdict == 'PASS':
+            task['now'] = '品控验收通过，可完成'
+            result = {'ok': True, 'message': f'{task_id} 品控PASS，可推进 Done', 'qa': task['qa']}
+        else:
+            # FAIL：打回执行部门（org 对应部门）
+            back_dept = task.get('org') or '执行部门'
+            task['state'] = 'Doing'
+            task['block'] = f'品控打回：{report or "验收未通过"}'
+            task['now'] = f'品控验收未通过，退回{back_dept}整改'
+            task.setdefault('flow_log', []).append({
+                'at': now_iso(), 'from': '品控官', 'to': back_dept,
+                'remark': f'打回整改：{report or "验收未通过"}',
+            })
+            result = {'ok': True, 'message': f'{task_id} 品控FAIL，打回{back_dept}整改', 'state': 'Doing'}
+        task['updatedAt'] = now_iso()
+        return tasks
+
+    modify_tasks(_do_qa)
+    return result
+
+
+def _run_iterate_score(task):
+    """触发迭代评分并把 iterate 结果落盘到 task['decomp_audit']（供 _handle_spec_submit 复用）。"""
+    try:
+        sys.path.insert(0, str(SCRIPTS))
+        import iterate_engine as _ite
+        _ite.iterate(task, max_rounds=1)
+    except Exception as e:
+        log.warning(f'迭代评分失败: {e}')
+        task.setdefault('decomp_audit', {})['iterate'] = {'error': str(e)}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -4152,6 +4444,46 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({'ok': False, 'error': 'taskId required'}, 400)
                 return
             result = handle_advance_state(task_id, comment)
+            self.send_json(result)
+            return
+
+        if p == '/api/spec-submit':
+            # 六合一 v2：规划部提交 SDD+CDD 契约
+            task_id = body.get('taskId', '').strip()
+            spec = body.get('spec')
+            cdd = body.get('cdd')
+            if not task_id:
+                self.send_json({'ok': False, 'error': 'taskId required'}, 400)
+                return
+            if not isinstance(spec, dict) and not isinstance(cdd, dict):
+                self.send_json({'ok': False, 'error': 'spec 或 cdd 至少提交一个（均为 dict）'}, 400)
+                return
+            result = _handle_spec_submit(task_id, spec if isinstance(spec, dict) else None,
+                                         cdd if isinstance(cdd, dict) else None)
+            self.send_json(result)
+            return
+
+        if p == '/api/boss-confirm':
+            # 六合一 v2：老板确认闸（awaiting_boss）—— 通过/驳回/豁免
+            task_id = body.get('taskId', '').strip()
+            decision = body.get('decision', '').strip()  # approve|reject|skip
+            comment = body.get('comment', '').strip()
+            if not task_id or decision not in ('approve', 'reject', 'skip'):
+                self.send_json({'ok': False, 'error': 'taskId and decision(approve/reject/skip) required'}, 400)
+                return
+            result = _handle_boss_confirm(task_id, decision, comment)
+            self.send_json(result)
+            return
+
+        if p == '/api/qa-result':
+            # 六合一 v2：品控验收提交（PASS/FAIL）
+            task_id = body.get('taskId', '').strip()
+            verdict = body.get('verdict', '').strip().upper()  # PASS|FAIL
+            report = body.get('report', '').strip()
+            if not task_id or verdict not in ('PASS', 'FAIL'):
+                self.send_json({'ok': False, 'error': 'taskId and verdict(PASS/FAIL) required'}, 400)
+                return
+            result = _handle_qa_result(task_id, verdict, report)
             self.send_json(result)
             return
 
