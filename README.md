@@ -1,75 +1,134 @@
-# MACS — Multi-Agent Collaboration System（三省六部）
+# 三省六部 · OpenClaw 多 Agent 协同工作系统
 
-> 一个通用的 OpenClaw 多 Agent 协同工作系统。**三省六部**架构，11 个 AI Agent 像真实朝廷团队一样协作。
+> 一套基于 OpenClaw Runtime 的多 Agent 协作框架。11 个 AI Agent 像朝廷团队一样分工协作，从需求拆解到交付验收，全程自动化流水线。  
+> 附带 **OCR 代码审查**（open-code-review 深度融合）——看板触发式自动审查，critical/high 缺陷自动建 P0 任务。
 
-## 🎯 是什么
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-基于 OpenClaw 的多 Agent 协同工作框架。一个 **调度 Agent（太子）** 居中协调，一个 **项目经理（尚书省）** 全权执行，**8 个专业 Agent** 各司其职，形成完整的"需求→分析→审议→派发→执行→质检→交付"流水线。
+---
+
+## 目录
+
+- [一、架构总览](#一架构总览)
+- [二、快速开始](#二快速开始)
+- [三、系统组件](#三系统组件)
+  - [3.1 Agent 角色](#31-agent-角色)
+  - [3.2 看板 Dashboard](#32-看板-dashboard)
+  - [3.3 OCR 代码审查](#33-ocr-代码审查)
+  - [3.4 全局技能池](#34-全局技能池)
+  - [3.5 模型路由](#35-模型路由)
+- [四、工作流](#四工作流)
+  - [4.1 三省六部完整流程](#41-三省六部完整流程)
+  - [4.2 触发条件](#42-触发条件)
+  - [4.3 OCR 自动审查在流程中的位置](#43-ocr-自动审查在流程中的位置)
+- [五、部署与运维](#五部署与运维)
+  - [5.1 安装](#51-安装)
+  - [5.2 升级](#52-升级)
+  - [5.3 自启动（systemd）](#53-自启动systemd)
+  - [5.4 卸载](#54-卸载)
+  - [5.5 扩编 Agent](#55-扩编-agent)
+  - [5.6 换机/重装部署](#56-换机重装部署)
+- [六、OCR 融合深度说明](#六ocr-融合深度说明)
+  - [6.1 架构](#61-架构)
+  - [6.2 API 端点](#62-api-端点)
+  - [6.3 自动触发机制](#63-自动触发机制)
+  - [6.4 去重与并发](#64-去重与并发)
+- [七、技术架构](#七技术架构)
+- [八、变更日志](#八变更日志)
+- [九、致谢与 License](#九致谢与-license)
+
+---
+
+## 一、架构总览
 
 ```
-老板下发任务
-  ↓
-太子(鲍澄): 理解需求 → 分析 → 生成需求摘要
-  ↓
-┌────────── 三省六部 ──────────┐
-│                               │
-│  中书省(筹微) → 起草 TASK.md    │
-│       ↓                       │
-│  门下省(审微) → 独立审查/封驳    │
-│       ↓                       │
-│  准奏 → 派发                   │
-│       ↓                       │
-│  尚书省(Ld.r) → 全权执行调度     │
-│       ↓                       │
-│  六部并行执行                  │
-│   ├─ 礼部(墨卿) — 文案/翻译     │
-│   ├─ 兵部(锋铸) — 前端/开发     │
-│   ├─ 工部(绘象) — 视觉/生图     │
-│   ├─ 刑部(镜衡) — 质量验收      │
-│   └─ 户部(归藏) — 整合交付      │
-│       ↓                       │
-│  吏部(驿使) → 任务路由          │
-│       ↓                       │
-│  钦天监(溶萃) → 每日朝报         │
-│                               │
-└───────────────────────────────┘
-  ↓
-太子: 最终审查 → 交付老板
+老板（需求方）
+  │
+  ▼
+╔══════════════════════════════════════════════════════╗
+║                    太子 (鮱澄)                        ║
+║              总揽全局 · 需求分析 · 最终交付             ║
+╚══════════════════════════════════════════════════════╝
+  │
+  ┌─────────────── 三省六部 ───────────────┐
+  │                                         │
+  │  ┌──────────┐    ┌──────────┐           │
+  │  │ 中书省    │ →  │ 门下省    │           │
+  │  │ 筹微     │    │ 审微     │           │
+  │  │ 起草方案  │    │ 独立审查  │           │
+  │  └──────────┘    └──────────┘           │
+  │       │                │                │
+  │       ▼                ▼                │
+  │  ┌──────────────────────────────────┐   │
+  │  │       尚书省（Ld.r）              │   │
+  │  │       全权执行调度                │   │
+  │  └──────────────────────────────────┘   │
+  │       │                                │
+  │       ▼                                │
+  │  ┌──────────────────────────────────┐   │
+  │  │        六部并行执行               │   │
+  │  │  ┌─────┐ ┌─────┐ ┌─────┐       │   │
+  │  │  │ 礼部 │ │ 兵部 │ │ 工部 │       │   │
+  │  │  │ 墨卿 │ │ 锋铸 │ │ 绘象 │       │   │
+  │  │  │文案  │ │开发  │ │视觉  │       │   │
+  │  │  └─────┘ └─────┘ └─────┘       │   │
+  │  │  ┌─────┐ ┌─────┐ ┌─────┐       │   │
+  │  │  │ 刑部 │ │ 户部 │ │ 吏部 │       │   │
+  │  │  │ 镜衡 │ │ 归藏 │ │ 驿使 │       │   │
+  │  │  │验收  │ │整合  │ │路由  │       │   │
+  │  │  └─────┘ └─────┘ └─────┘       │   │
+  │  └──────────────────────────────────┘   │
+  │                                         │
+  └─────────────────────────────────────────┘
+  │
+  ▼
+╔══════════════════════════════════════════════════════╗
+║               OCR 代码审查自动触发                    ║
+║     锋铸完成 → Review 状态 → 自动审查 → 缺陷建任务    ║
+╚══════════════════════════════════════════════════════╝
+  │
+  ▼
+  交付物（交付报告 · 代码 · 设计 · 文案）
+
 ```
 
-## 🏛️ 三省六部 Agent 角色
+### 核心设计原则
 
-11 个 Agent 各具独立人格和专属技能，按需随时扩编。
+| 原则 | 说明 |
+|------|------|
+| **三省制衡** | 中书起草 → 门下审查 → 尚书执行，三方独立互不隶属 |
+| **六部专业化** | 每个 Agent 专精一个领域，不跨职能 |
+| **太子不粘锅** | 太子只做需求理解和最终交付，不参与具体执行，确保客观 |
+| **自动审查** | OCR 代码审查在锋铸（开发）完成后自动触发，结果不阻塞流程 |
+| **零外部依赖** | Dashboard 后端仅用 Python stdlib，无 pip install 依赖 |
 
-| Agent | 官号 | 省/部 | 品级 | 职责 |
-|-------|------|------|------|------|
-| `main` | 鮱澄 | 太子 | 储君 | 总揽全局、需求分析、最终交付 |
-| `ld-r` | Ld.r | 尚书省·尚书令 | 正一品 | 项目管理、全权执行调度 |
-| `guihua` | 筹微 | 中书省·中书令 | 正二品 | 需求拆解 → 生成 TASK.md |
-| `shenyi` | 审微 | 门下省·侍中 | 正一品 | 独立审查 TASK.md → 准奏或封驳 |
-| `paifa` | 驿使 | 吏部·吏部尚书 | 正二品 | 任务路由 → 派发到执行部门 |
-| `wenan` | 墨卿 | 礼部·礼部尚书 | 正二品 | 网站文案/品牌故事/SEO/翻译 |
-| `daima` | 锋铸 | 兵部·兵部尚书 | 正二品 | 前端开发/功能实现/性能优化 |
-| `sheji` | 绘象 | 工部·工部尚书 | 正二品 | 视觉规范/UI设计/图片生成 |
-| `shencha` | 镜衡 | 刑部·刑部尚书 | 正二品 | 独立质量验收/对照标准评分 |
-| `huizong` | 归藏 | 户部·户部尚书 | 正二品 | 整合交付/生成交付报告 |
-| `rongcui` | 溶萃 | 钦天监·朝报官 | 正三品 | 晨间简报/团队状态日报 |
+---
 
-## 🚀 快速安装（即装即用）
+## 二、快速开始
+
+### 前置条件
+
+| 依赖 | 版本要求 | 说明 |
+|------|---------|------|
+| OpenClaw | v2026.7.1+ | Agent 运行时 |
+| Python | 3.10+ | Dashboard 后端 |
+| Node.js | 18+ | OCR CLI（可选，如不启用 OCR 可跳过） |
+
+### 安装
 
 ```bash
-# 1. 克隆
-git clone https://github.com/ilxu7z/MACS-pm.git
-cd MACS-pm
+# 1. 克隆仓库
+git clone https://github.com/ilxu7z/oc-macs.git
+cd oc-macs
 
-# 2. 一键安装（自动注册所有 Agent + 创建 workspace + 同步配置）
+# 2. 安装并注册所有 Agent
 chmod +x install.sh && ./install.sh
 
-# 3. 添加 Agent 的 API Key（首次需要）
+# 3. 首次需要为子 Agent 配置 API Key
 openclaw agents add guihua
 # 按提示输入 API Key，然后重新运行 install.sh 同步到所有 Agent
 
-# 4. 启动 Dashboard
+# 4. 启动看板
 chmod +x start.sh && ./start.sh
 
 # 5. 打开看板
@@ -83,244 +142,87 @@ open http://127.0.0.1:7891
 - ✅ 初始化 Dashboard 数据文件
 - ✅ 配置 exec 超时保护（600 秒熔断）
 
-### 🔄 升级模式（`--mode update`）
-
-如果已经安装过，使用升级模式进行增量更新：
+### 启动后验证
 
 ```bash
-./install.sh --mode update
-# 或简写
-./install.sh update
+# 看板健康检查
+curl http://127.0.0.1:7891/healthz
+
+# OCR 状态检查（如已安装）
+curl http://127.0.0.1:7891/api/ocr/status
 ```
-
-升级模式自动完成：
-- ✅ 版本比对（读取文件头部 `<!-- version:MAJOR.MINOR.PATCH -->` 标记）
-- ✅ **MAJOR 变更** → 备份后覆盖（文件结构不兼容）
-- ✅ **MINOR/PATCH 变更** → 增量追加（逐段比对，不重复写入）
-- ✅ **版本相同** → 跳过，不做任何操作
-- ✅ 大文件（>5MB）跳过，提示手动处理
-- ✅ 非 UTF-8 编码文件跳过增量追加，避免乱码
-- ✅ 无需重新注册 Agent 或重建 workspace
-
-## 🗑️ 卸载
-
-```bash
-# 清理子 Agent workspace（保留 main）
-./uninstall.sh --mode clean
-
-# 清理所有 Agent workspace（含 main）
-./uninstall.sh --mode clean-all
-
-# 清理 deprecated 标记段落（默认模式）
-./uninstall.sh --mode clean-update
-
-# 完全卸载所有 Agent 注册 + 文件
-./uninstall.sh --mode uninstall
-
-# 自动确认（跳过确认提示）
-./uninstall.sh --mode uninstall --yes
-```
-
-| 模式 | 说明 |
-|------|------|
-| `clean` | 清理子 Agent workspace 目录，保留 main 配置 |
-| `clean-all` | 清理所有 Agent 的 workspace（含 main） |
-| `clean-update` | 清理文件中带有 `deprecated` 标记的段落（默认），备份保存为 `*.bak.clean-*` |
-| `uninstall` | 完全卸载：删除 Agent 注册、配置文件、workspace 目录，恢复环境 |
-
-> ⚠️ 卸载前会自动备份 `openclaw.json` 到 `*.bak.pre-uninstall-*`，方便回滚。
-
-## 📦 版本升级策略
-
-系统采用 **版本标记协议** 实现智能升级，每个受管文件头部包含 HTML 注释格式的版本标记：
-
-```html
-<!-- version:v2.0.0-system -->
-```
-
-### 版本比较规则
-
-| 版本变更 | 策略 | 说明 |
-|---------|------|------|
-| 目标不存在 | 创建 | 直接复制 |
-| MAJOR 变更 | 覆盖 | 备份 `*.bak.YYYYMMDD-HHMMSS` 后覆盖 |
-| MINOR/PATCH 变更 | 增量追加 | 逐段比对，只追加新内容 |
-| 版本相同 | 跳过 | 不操作 |
-
-### 增量追加算法
-
-`append_incremental()` 函数实现智能追加：
-
-1. 读取目标文件全部内容到内存
-2. 逐段比对源文件段落（以空行分隔）
-3. 只追加目标文件中**不存在**的段落
-4. 大文件模式（>1MB）使用 grep 批量预检，不加载全量
-5. 编码检测：`file -I` 识别非 UTF-8/US-ASCII 文件，跳过追加
-
-> 升级前自动创建备份文件，支持回滚。
-
-## 🔍 OCR 集成
-
-OCR（OpenClaw + Crestodian + RAG）融合系统为三省六部制提供 SDD/CDD 方案支持，实现一键安装升级。
-
-### 安装与验证
-
-安装脚本自动安装 OCR CLI：
-
-```bash
-# 验证 OCR 版本
-ocr --version
-
-# 如果版本低于 1.8.0，install.sh 自动升级
-```
-
-### 规则文件
-
-OCR 规则文件位于 `.github/ocr-rules.md`，包含：
-
-- **版本协议**：文件头部 `<!-- version:MAJOR.MINOR.PATCH-system -->` 标记
-- **写入策略**：MAJOR 覆盖 / MINOR 增量追加 / 版本相同跳过
-- **大文件处理**：>5MB 提示手动处理，>1MB≤5MB grep 预检
-- **编码检测**：`file -I` 检测，非 UTF-8 跳过
-- **备份规则**：覆盖/增量追加前自动创建备份文件
-
-此规则文件同时被 GitHub Actions 工作流引用，确保 CI/CD 流程中的版本一致性。
 
 ---
 
-## 📋 看板 Dashboard
+## 三、系统组件
 
-启动后访问 `http://127.0.0.1:7891`，提供：
+### 3.1 Agent 角色
 
-- **旨意看板** — 所有任务的实时状态（Kanban 列视图）
-  - 自动发现 OpenClaw 运行时的活跃会话，同步到看板
-  - 支持手动创建/叫停/恢复任务
-  - **阻塞任务巡检** — 每 15 分钟自动扫描 Blocked 任务，发现时通知
-- **官员总览** — 11 个 Agent 的 Token 消耗、活跃度、功勋排行
-- **技能配置** — 全局技能池（27+ 个共享技能）+ 每个 Agent 独立开关
-- **模型配置** — 每个 Agent 独立切换 LLM 模型
-- **奏折阁** — 已完成任务自动归档，可回溯
+11 个 Agent 各具独立人格和专属技能，按需可随时扩编。
 
-### Dashboard 页面
+| Agent ID | 官号 | 省/部 | 品级 | 职责 | 推荐模型 |
+|----------|------|------|:----:|------|---------|
+| `main` | 鮱澄 | 太子 | 储君 | 总揽全局、需求分析、最终交付 | DeepSeek V4 |
+| `ld-r` | Ld.r | 尚书省·尚书令 | 正一品 | 项目管理、全权执行调度、任务分解 | DeepSeek V4 |
+| `guihua` | 筹微 | 中书省·中书令 | 正二品 | 需求拆解 → 生成 TASK.md 方案 | DeepSeek V4 Pro |
+| `shenyi` | 审微 | 门下省·侍中 | 正一品 | 独立审查 TASK.md → 准奏或封驳 | DeepSeek V4 Pro |
+| `paifa` | 驿使 | 吏部·吏部尚书 | 正二品 | 任务路由 → 派发到执行部门 | DeepSeek V4 Flash |
+| `wenan` | 墨卿 | 礼部·礼部尚书 | 正二品 | 网站文案/品牌故事/SEO/翻译 | GLM-5.1 |
+| `daima` | 锋铸 | 兵部·兵部尚书 | 正二品 | 前端开发/功能实现/性能优化 | Claude / DeepSeek |
+| `sheji` | 绘象 | 工部·工部尚书 | 正二品 | 视觉规范/UI设计/图片生成 | Gemini |
+| `shencha` | 镜衡 | 刑部·刑部尚书 | 正二品 | 独立质量验收/对照标准评分 | DeepSeek V4 |
+| `huizong` | 归藏 | 户部·户部尚书 | 正二品 | 整合交付/生成交付报告 | DeepSeek V4 Flash |
+| `rongcui` | 溶萃 | 钦天监·朝报官 | 正三品 | 晨间简报/团队状态日报 | DeepSeek V4 Flash |
 
-| 页面 | 功能 |
+### 3.2 看板 Dashboard
+
+启动后访问 `http://127.0.0.1:7891`，提供以下页面：
+
+| 页面 | 路由 | 功能 |
+|------|------|------|
+| **旨意看板** | `/` | 任务 Kanban 视图（Taizi/Zhongshu/Menxia/Assigned/Doing/Review/Done）<br>自动发现 OpenClaw 运行时活跃会话并同步到看板<br>支持手动创建/叫停/恢复/归档任务<br>15 分钟自动巡检阻塞任务 |
+| **官员总览** | `/officials` | 11 个 Agent 的 Token 消耗、活跃度、功勋排行 |
+| **配置中心** | `/config` | 每个 Agent 独立切换 LLM 模型 + 全局技能池开关 |
+| **存档阁** | `/archive` | 已完成任务归档，可回溯历史 |
+
+### 3.3 OCR 代码审查
+
+集成 [open-code-review](https://github.com/alibaba/open-code-review)（阿里 OCR）v1.8.3，为三省六部流程提供自动代码审查能力。
+
+**核心能力**：
+
+| 能力 | 说明 |
 |------|------|
-| `/` 看板 | 任务 Kanban 视图（Doing/Review/Blocked/Done） |
-| `/officials` 官员 | 各 Agent 消耗统计和活跃度 |
-| `/config` 配置 | 每个 Agent 的模型设置 + 全局技能开关 |
-| `/archive` 存档 | 已完成任务归档查询 |
+| **diff 审查** | 基于 git diff 的增量代码审查，只审查变更部分 |
+| **全量扫描** | 对整个目录做全量扫描，不依赖 git |
+| **断点续审** | 超时或中断后可恢复，不丢已审查结果 |
+| **自动触发** | 锋铸完成 → 任务进入 Review 状态时自动触发 |
+| **去重保护** | 同一 task + 同一 commit hash 只审一次 |
+| **并发控制** | 最多同时 N 个审查（Semaphore 保护） |
+| **缺陷分级** | critical / high / medium / low，自动筛选 critical+high 建 P0 任务 |
 
-## 🎓 全局技能池（v4 新增）
+**安装 OCR CLI**：
+
+```bash
+npm install -g @alibaba-group/open-code-review
+# 或通过 install.sh 自动安装
+# 配置 LLM 后验证
+ocr --version
+```
+
+LLM 配置见 `~/.opencodereview/config.json`，支持 provider-based 格式（kimi / deepseek / z-ai 等）。
+
+### 3.4 全局技能池
 
 27+ 个预置技能自动发现并共享到所有 Agent：
-- `design-taste` — 设计品味方法论
-- `systematic-debugging` — 系统化调试流程
-- `bash-safety` — Shell 安全规范
-- `test-driven-development` — TDD 开发规范
-- `brainstorming` — 头脑风暴方法论
-- …等 27+ 个技能
 
-所有 Agent 在 `/config` 页面可以看到全局技能池，一键启用/禁用。
+`design-taste` · `systematic-debugging` · `bash-safety` · `test-driven-development` · `brainstorming` · `diagram-maker` · `image-generation` · `meme-maker` · …等
 
-## 🛡️ 自动保护机制（v4 新增）
+所有 Agent 在 Dashboard `/config` 页面可看到全局技能池，一键启用/禁用，无需手动编辑配置文件。
 
-- **exec 超时熔断** — 所有 shell 命令 600 秒自动终止，防止脚本卡死阻塞整个流程
-- **阻塞任务巡检** — 后台每 15 分钟扫描 Blocked 任务，超过 30 分钟自动通知
-- **调度自动恢复** — 任务停滞超 600 秒自动触发重试 + 升级机制（门下省→尚书省）
-- **Gateway 重启保护** — 独立后台进程不依赖 Gateway 生命周期
+### 3.5 模型路由
 
-## 🔧 工作流
-
-### 什么时候走三省六部
-
-太子（鮱澄）根据任务复杂度自动判断：
-
-#### 🔴 走三省六部流程（复杂任务）
-
-| 信号 | 示例 |
-|------|------|
-| 涉及多人协作/多环节 | "帮我做个产品官网" |
-| 需要计划+拆解 | "写一份营销方案" |
-| 需要独立审查 | "出一份竞品分析" |
-| 有交付物需多方评审 | "帮出一套品牌VI方案" |
-| 用户主动触发三省六部 | "下旨：产品画册设计" |
-
-#### 🟢 直接回答，不走流程（简单任务）
-
-| 情况 | 示例 |
-|------|------|
-| 问信息 | "XX产品的参数是什么" |
-| 小改动 | "把这个按钮改成蓝色" |
-| 讨论/决策 | "你觉得这个方案怎么样" |
-| 查看状态 | "看看看板有没有异常" |
-
-### 如何主动触发
-
-说以下任意一句，调度 Agent 就会启动三省六部流程：
-
-```
-用三省六部制，帮我做个XX
-下旨：XX
-启动三省六部，帮我XX
-```
-
-看板上也有「👑 下旨」按钮，效果一样。
-
-### 🔄 完整流程
-
-```
-你说: "下旨：帮我做冲调类产品官网"
-
-太子:
-1. 理解需求 → 生成需求摘要
-2. → 筹微(中书省) → 产出 TASK.md
-3. → 审微(门下省) → 独立审查 → 准奏/封驳
-4. 封驳则修改 → 重新审议
-5. 准奏 → Ld.r(尚书省) → 全权派发执行
-6. → 六部并行执行：
-   ├─ 墨卿(礼部) → 文案重写/多语种翻译
-   ├─ 锋铸(兵部) → 前端开发/页面实现
-   ├─ 绘象(工部) → 视觉设计/图片生成
-   ├─ 镜衡(刑部) → 独立质量验收
-   └─ 归藏(户部) → 整合交付包
-7. 太子最终审查 → 交付老板
-```
-
-**你的投入：给任务 → 关键决策点确认 → 收结果。中间不用管。**
-
-## 🔄 换电脑 / 重装部署
-
-```bash
-git clone https://github.com/ilxu7z/MACS-pm.git
-cd MACS-pm
-./install.sh
-./start.sh
-```
-
-所有 Agent 配置和注册信息通过 Git 同步，换机一键恢复。
-
-## ⚔️ 扩编 Agent
-
-当项目需要当前军团没有的角色时，一键创建：
-
-```bash
-# 用法: add-agent.sh <agent_id> <display_name> <role> <description>
-chmod +x scripts/add-agent.sh
-./scripts/add-agent.sh shuju "数枢" "数据分析师" "数据采集、清洗、报表生成"
-```
-
-脚本自动完成：
-1. 生成 SOUL.md（智能推荐适合该角色的 LLM 模型）
-2. 注册到 `registry.json`
-3. 注册到 OpenClaw
-4. 创建 workspace + 同步 API Key
-5. 更新 `sync_agent_config.py` 让 Dashboard 可配置
-
-然后 `git add -A && git commit && git push`，任何电脑 clone 后 `./install.sh` 即可同步。
-
-## 🔌 模型路由配置
-
-系统支持每个 Agent 独立配置 LLM 模型，通过 Dashboard 管理或直接编辑 `registry.json`：
+每个 Agent 可独立配置 LLM 模型，通过 Dashboard 编辑或直接修改 `registry.json`：
 
 ```json
 {
@@ -338,37 +240,346 @@ chmod +x scripts/add-agent.sh
 ```
 
 推荐按角色匹配模型：
-- **推理/分析型**（规划、审查）→ DeepSeek / GPT
-- **文案型**（文案）→ GLM-5.1
-- **代码型**（开发）→ Claude
-- **视觉型**（设计/生图）→ Gemini
 
-## 🧬 技术架构
+| 角色类型 | 推荐模型 | 原因 |
+|---------|---------|------|
+| 推理/分析（规划、审查） | DeepSeek V4 Pro / GPT | 长上下文、深度推理 |
+| 文案（墨卿） | GLM-5.1 | 中文文案质量高 |
+| 代码（锋铸） | Claude / DeepSeek V4 | 代码生成准确 |
+| 视觉（绘象） | Gemini | 多模态理解强 |
+
+---
+
+## 四、工作流
+
+### 4.1 三省六部完整流程
+
+```
+你说: "下旨：帮我做冲调类产品官网"
+
+1. 太子（鮱澄）
+   └─ 理解需求 → 生成需求摘要
+
+2. 中书省（筹微）
+   └─ 产出 TASK.md 方案
+
+3. 门下省（审微）
+   ├─ 独立审查方案
+   ├─ 准奏 → 进入派发
+   └─ 封驳 → 退回中书省修改 → 重新审议
+
+4. 尚书省（Ld.r）
+   └─ 全权派发执行
+
+5. 六部并行执行
+   ├─ 礼部（墨卿）→ 文案重写/多语种翻译
+   ├─ 兵部（锋铸）→ 前端开发/页面实现
+   ├─ 工部（绘象）→ 视觉设计/图片生成
+   ├─ 刑部（镜衡）→ 独立质量验收
+   └─ 户部（归藏）→ 整合交付包
+
+6. → 自动触发 OCR 代码审查（锋铸完成 → Review 状态）
+
+7. 太子（鮱澄）
+   └─ 最终审查 → 交付老板
+
+你的投入: 给任务 → 关键决策点确认 → 收结果。中间不用管。
+```
+
+### 4.2 触发条件
+
+太子根据任务复杂度自动判断是否走三省六部流程：
+
+#### 🔴 走三省六部流程（复杂任务）
+
+| 信号 | 示例 |
+|------|------|
+| 涉及多人协作/多环节 | "帮我做个产品官网" |
+| 需要计划+拆解 | "写一份营销方案" |
+| 需要独立审查 | "出一份竞品分析" |
+| 有交付物需多方评审 | "帮出一套品牌VI方案" |
+| 用户主动触发 | "下旨：产品画册设计" / "用三省六部制" |
+
+#### 🟢 直接回答，不走流程（简单任务）
+
+| 情况 | 示例 |
+|------|------|
+| 问信息 | "XX产品参数是什么" |
+| 小改动 | "把这个按钮改成蓝色" |
+| 讨论/决策 | "你觉得这个方案怎么样" |
+| 查看状态 | "看看看板有没有异常" |
+
+### 4.3 OCR 自动审查在流程中的位置
+
+锋铸（兵部）完成代码产出后，任务状态推进到 `Review`，此时看板自动触发 OCR 审查：
+
+```
+锋铸完成 → 推进到 Review
+  │
+  ▼
+看板 server.py 自动调用 ocr_auto_trigger
+  ├─ 检查去重缓存（同 task + 同 commit 跳过）
+  ├─ 执行 ocr_review（基于 git diff）
+  ├─ 解析返回的评论
+  ├─ 筛选 critical / high 级别缺陷
+  └─ 构造 P0 任务对象（写入 task['ocr_auto']）
+  │
+  ▼
+进入正常审微流程（不阻塞，OCR 异常由 try/except 包裹）
+```
+
+> ⚠️ OCR 审查是**异步副作用**，不阻塞状态流转。即使 LLM 调用超时或失败，任务仍正常进入 Review 状态。
+
+---
+
+## 五、部署与运维
+
+### 5.1 安装
+
+```bash
+git clone https://github.com/ilxu7z/oc-macs.git
+cd oc-macs
+./install.sh
+```
+
+安装脚本自动完成：
+- 注册 11 个 Agent 到 OpenClaw
+- 创建 workspace 和 skills 目录
+- 同步 API Key 到所有 Agent
+- 初始化 Dashboard 数据文件
+- 配置 exec 超时保护（600 秒熔断）
+- 安装 OCR CLI（如 Node.js 已就绪）
+
+### 5.2 升级
+
+```bash
+./install.sh --mode update
+# 或简写
+./install.sh update
+```
+
+升级模式特性：
+
+| 版本变更 | 策略 | 说明 |
+|---------|------|------|
+| MAJOR 变更 | 覆盖 | 备份 `*.bak.YYYYMMDD-HHMMSS` 后覆盖 |
+| MINOR/PATCH 变更 | 增量追加 | 逐段比对，只追加新内容 |
+| 版本相同 | 跳过 | 不操作 |
+
+版本标记基于文件头部 HTML 注释 `<!-- version:MAJOR.MINOR.PATCH -->`。
+
+### 5.3 自启动（systemd）
+
+三省六部看板通过 systemd user service 管理，随 OpenClaw Gateway 自动启停。
+
+```bash
+# 安装 systemd 服务
+cp oc-macs-dashboard.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now oc-macs-dashboard.service
+
+# 查看状态
+systemctl --user status oc-macs-dashboard.service
+
+# 查看日志
+journalctl --user -u oc-macs-dashboard.service -f
+```
+
+依赖关系：
+
+```
+openclaw-gateway.service
+  └─ BindsTo → oc-macs-dashboard.service
+```
+
+- Gateway 启动 → 看板自动启动
+- Gateway 停止 → 看板自动停止
+- 看板崩溃 → `Restart=always`，5 秒后自动重启
+- 电脑重启 → `systemctl --user start openclaw-gateway` 即可全部恢复
+
+### 5.4 卸载
+
+```bash
+# 清理子 Agent workspace（保留 main）
+./uninstall.sh --mode clean
+
+# 清理所有 Agent workspace（含 main）
+./uninstall.sh --mode clean-all
+
+# 清理 deprecated 标记段落
+./uninstall.sh --mode clean-update
+
+# 完全卸载
+./uninstall.sh --mode uninstall
+
+# 自动确认（跳过提示）
+./uninstall.sh --mode uninstall --yes
+```
+
+> ⚠️ 卸载前自动备份 `openclaw.json` 到 `*.bak.pre-uninstall-*`，方便回滚。
+
+### 5.5 扩编 Agent
+
+需要新角色时，一键创建：
+
+```bash
+chmod +x scripts/add-agent.sh
+./scripts/add-agent.sh shuju "数枢" "数据分析师" "数据采集、清洗、报表生成"
+```
+
+脚本自动完成：
+1. 生成 SOUL.md（智能推荐适合该角色的 LLM 模型）
+2. 注册到 `registry.json`
+3. 注册到 OpenClaw
+4. 创建 workspace + 同步 API Key
+5. 更新 `sync_agent_config.py` 使 Dashboard 可配置
+
+### 5.6 换机/重装部署
+
+```bash
+git clone https://github.com/ilxu7z/oc-macs.git
+cd oc-macs
+./install.sh
+./start.sh
+```
+
+所有 Agent 配置和注册信息通过 Git 同步，换机一键恢复。
+
+---
+
+## 六、OCR 融合深度说明
+
+### 6.1 架构
+
+```
+┌─────────────────────────────────────────────────────┐
+│                   看板 Dashboard                      │
+│                                                       │
+│  /api/ocr/* 端点 ← 手动触发（curl / 前端面板）         │
+│  handle_advance_state → Review 时自动触发             │
+│                                                       │
+└──────────────────────┬────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────┐
+│              scripts/ocr_bridge.py                    │
+│                                                       │
+│  ocr_review()  ──  diff-based 审查                    │
+│  ocr_scan()    ──  全量扫描                          │
+│  ocr_resume()  ──  断点续审                          │
+│  ocr_status()  ──  CLI 状态检查                      │
+│  save_ocr_result() ── 原子写入结果文件                │
+│                                                       │
+│  并发控制: threading.Semaphore(MAX_CONCURRENT)        │
+│  超时保护: subprocess.run(timeout=...)                │
+└──────────────────────┬────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────┐
+│              scripts/ocr_auto_trigger.py              │
+│                                                       │
+│  auto_review_and_create_tasks()                       │
+│    ├─ 去重检查（同 task + 同 commit 跳过）            │
+│    ├─ 调用 ocr_review()                               │
+│    ├─ 筛选 critical/high 缺陷                         │
+│    └─ 构造 P0 任务对象                                │
+│                                                       │
+│  data/ocr_dedup_cache.json ← 去重缓存                 │
+└─────────────────────────────────────────────────────┘
+                       │
+                       ▼
+           open-code-review CLI (v1.8.3)
+           ~/.opencodereview/config.json ← LLM 配置
+```
+
+### 6.2 API 端点
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/ocr/status` | 检查 OCR CLI 版本和 LLM 配置状态 |
+| POST | `/api/ocr/review` | diff 审查，body: `{repoDir, rulePath, from?, to?}` |
+| POST | `/api/ocr/scan` | 全量扫描，body: `{repoDir, rulePath, paths?}` |
+| POST | `/api/ocr/resume` | 断点续审，body: `{repoDir, rulePath, sessionId}` |
+| POST | `/api/ocr/results` | 查询历史结果，body: `{taskId?, sessionId?}` |
+
+### 6.3 自动触发机制
+
+在 `dashboard/server.py` 的 `handle_advance_state` → `_do_advance` 中（第 3250 行附近）：
+
+```python
+if next_state == 'Review':
+    try:
+        # 动态导入 ocr_auto_trigger
+        trigger_result = ocat.auto_review_and_create_tasks(task_id, repo_dir)
+        if trigger_result.get('tasks_created'):
+            task['ocr_auto'] = {
+                'triggered': True,
+                'created': trigger_result['tasks_created']
+            }
+            # 写入 flow_log
+    except Exception as e:
+        log.warning(f"OCR 自动审查触发失败: {e}")
+```
+
+### 6.4 去重与并发
+
+**去重**：`data/ocr_dedup_cache.json` 存储 `{task_id: commit_hash}` 映射。同一 task 同一 commit 直接跳过，不重复调用 LLM。
+
+**并发**：`ocr_bridge.py` 中使用 `threading.Semaphore(MAX_CONCURRENT)` 保护，最多同时运行 N 个 OCR 审查进程。
+
+---
+
+## 七、技术架构
 
 ```
 OpenClaw Multi-Agent Runtime
-       ↓ 自动发现(15s间隔)
+       │
+       │ 自动发现（15s 间隔）
+       ▼
 sync_from_openclaw_runtime.py
-       ↓
-tasks_source.json (看板数据源)
-       ↓
-Dashboard (React + Vite + Python http.server)
-       ↓
-看板UI、官员统计、模型配置、归档
+       │
+       ▼
+tasks_source.json（看板数据源）
+       │
+       ▼
+Dashboard（Python http.server + HTML/JS）
+       │
+       ├─ 看板 UI（Kanban 视图）
+       ├─ 官员统计（Token/活跃度）
+       ├─ 配置中心（模型/技能）
+       ├─ 存档阁（历史归档）
+       └─ OCR 端点（代码审查）
 ```
 
 | 组件 | 技术栈 |
 |------|--------|
 | Agent 运行时 | OpenClaw Runtime |
-| 数据同步 | Python（零外部依赖, 仅 stdlib） |
-| Dashboard 后端 | Python `http.server`（零外部依赖） |
-| Dashboard 前端 | React 18 + TypeScript + Vite |
-| 数据存储 | JSON 文件 |
+| 数据同步 | Python（零外部依赖，仅 stdlib） |
+| Dashboard 后端 | Python `http.server`（ThreadingHTTPServer） |
+| Dashboard 前端 | 原生 HTML/JS + CSS |
+| 数据存储 | JSON 文件 + 文件锁 |
+| OCR 代码审查 | open-code-review v1.8.3 |
+| 自启动 | systemd user service（BindsTo openclaw-gateway） |
 
-## 📄 致谢
+---
 
-本项目看板引擎和架构设计受 [edict (三省六部)](https://github.com/cft0808/edict) 启发，Agent 层和调度逻辑完全重写以适配 OpenClaw 多 Agent 协同场景。
+## 八、变更日志
 
-## 📜 License
+参见 [CHANGELOG.md](CHANGELOG.md)。
 
-MIT
+### 近期关键版本
+
+| 版本 | 日期 | 内容 |
+|------|------|------|
+| v2.0.0 | 2026-07-31 | 部署系统全面升级，OCR 深度融合 Phase 1+2 |
+| v2.1.0 | 2026-07-31 | systemd 自启动修复，自动触发 OCR 审查 |
+
+---
+
+## 九、致谢与 License
+
+本项目看板引擎和架构设计受 [edict（三省六部）](https://github.com/cft0808/edict) 启发，Agent 层和调度逻辑完全重写以适配 OpenClaw 多 Agent 协同场景。
+
+OCR 代码审查能力基于 [alibaba/open-code-review](https://github.com/alibaba/open-code-review) v1.8.3。
+
+**License**: MIT
