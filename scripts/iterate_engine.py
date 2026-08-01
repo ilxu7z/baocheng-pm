@@ -213,7 +213,9 @@ def iterate(task, max_rounds=None, flow_log_append=None):
 def _persist_iterate(task, rec, now_hash, final_audit=None, history=None):
     """把 iterate 结果落盘到 task['decomp_audit']['iterate']，持久化当前
     content hash 供下一次 submit 周期做停滞比对。"""
-    task.setdefault('decomp_audit', {})
+    # 兼容 old task 中 decomp_audit 为 None 的情况
+    if not isinstance(task.get('decomp_audit'), dict):
+        task['decomp_audit'] = {}
     it = {
         'ready': rec['ready'],
         'final_score_pct': final_audit.get('score_pct') if final_audit else rec.get('score_pct'),

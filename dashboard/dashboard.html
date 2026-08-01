@@ -1028,8 +1028,9 @@ function renderSixUnitySection(t){
 
   const itHtml = score!==null ? `<div class="six-block">
     <div class="six-label">🎯 方案落地把握</div>
-    <div style="font-size:18px;font-weight:700;color:${score>=98?'var(--ok)':'var(--danger)'}">${Number(score).toFixed(1)}%${score>=98?' ✅':' ⚠️需补齐'}</div>
+    <div style="font-size:18px;font-weight:700;color:${score>=98?'var(--ok)':'var(--danger)'}">${Number(score).toFixed(1)}%${score>=98?' ✅':(it.stalled?' ⛔ 停滞(未消化)':' ⚠️需补齐')}</div>
     ${it.rounds?`<div style="font-size:11px;color:var(--muted)">已迭代 ${it.rounds} 轮</div>`:''}
+    ${it.stalled?`<div style="font-size:11px;color:#ff5270;margin-top:2px">停滞检测：上次补齐要求未反映到 spec，需规划部按要求改写后重新提交</div>`:''}
   </div>` : '';
 
   const bossHtml = awaiting ? `<div class="six-block" style="border-color:#f5a62366;background:#f5a6230c">

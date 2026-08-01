@@ -872,7 +872,8 @@ def handle_create_task(title, org='规划部', official='规划师', priority='n
         'cdd_injected': None,            # CDD 注入留痕 {layer,knowledge_src,spec_hash,timestamp,agent}
         'skill_ref': None,               # SE 环④：任务引用过的 skill
         'experience_card': None,         # SE 环①：Done 后经验卡
-        'decomp_audit': None,            # 任务分解自查 {score_pct,dims,verdict,audit_seq}
+        'decomp_audit': {},              # 任务分解自查 {score_pct,dims,verdict,audit_seq, iterate}
+        'cdd': None,                     # CDD 协作契约 {agents,interfaces,alignment_rules}（军师/规划部提交）
         'flow_log': [{
             'at': now_iso(),
             'from': '老板',
@@ -3536,6 +3537,7 @@ def _build_six_unity_report():
             'ORC审查': {'triggered': 0},
             'SE经验': {'cards': 0},
         },
+        'iterate': {'attempted': 0, 'ready': 0, 'stalled': 0, 'below_threshold': 0},
         'experience_cards_file': str(DATA / 'experience-cards.jsonl'),
     }
     for t in tasks:
@@ -3555,6 +3557,16 @@ def _build_six_unity_report():
                 report['pillars']['任务分解']['passed'] += 1
             else:
                 report['pillars']['任务分解']['blocked'] += 1
+        # 迭代(iterate) 可观测：轮次/分数/停滞
+        _it = (t.get('decomp_audit') or {}).get('iterate')
+        if _it:
+            report['iterate']['attempted'] += 1
+            if _it.get('stalled'):
+                report['iterate']['stalled'] += 1
+            elif _it.get('ready'):
+                report['iterate']['ready'] += 1
+            else:
+                report['iterate']['below_threshold'] += 1
         if t.get('ocr_auto'):
             report['pillars']['ORC审查']['triggered'] += 1
     # SE 经验卡计数（读 jsonl）
@@ -3905,7 +3917,9 @@ def _run_iterate_score(task):
         _ite.iterate(task, max_rounds=1)
     except Exception as e:
         log.warning(f'迭代评分失败: {e}')
-        task.setdefault('decomp_audit', {})['iterate'] = {'error': str(e)}
+        if not isinstance(task.get('decomp_audit'), dict):
+            task['decomp_audit'] = {}
+        task['decomp_audit']['iterate'] = {'error': str(e)}
 
 
 class Handler(BaseHTTPRequestHandler):
