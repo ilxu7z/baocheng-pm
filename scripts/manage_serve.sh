@@ -23,6 +23,10 @@ case "${1:-}" in
     done)
     [ -n "$PYTHON_BIN" ] || PYTHON_BIN=python3
     export EDICT_HOME="$REPO_DIR" EDICT_PYTHON="$PYTHON_BIN"
+    # SIX_UNITY 门禁开关：默认 0(只留痕)，设为 1 启用拦截类门禁。
+    # 可用 env 预设，或 export SIX_UNITY=1 后再 start。
+    export SIX_UNITY="${SIX_UNITY:-0}"
+    echo "ℹ️ SIX_UNITY=${SIX_UNITY} (1=启用门禁拦截 / 0=过渡只留痕)"
     # run_loop 后台
     nohup bash scripts/run_loop.sh > "$LOGDIR/refresh.log" 2>&1 &
     echo $! >> "$PIDFILE"
