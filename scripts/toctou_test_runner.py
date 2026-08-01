@@ -382,7 +382,7 @@ def test_scenario_e():
                 t.setdefault('flow_log', []).append({
                     'at': '2026-06-26T20:00:00Z',
                     'from': 'Dashboard',
-                    'to': '尚书省',
+                    'to': '执行办',
                     'remark': '智能解卡：任务已恢复'
                 })
         return tasks

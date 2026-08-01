@@ -25,7 +25,7 @@ ID_LABEL = {
     'main':     {'label': '鲍澄',   'role': '项目负责人', 'duty': '需求分析、调度决策、最终交付', 'emoji': '🏛️'},
     'ld-r':     {'label': 'Ld.r',   'role': '执行经理',   'duty': '项目管理、方案执行、督办推进', 'emoji': '📮'},
     'guihua':   {'label': '筹微',   'role': '规划师',     'duty': '需求拆解、生成TASK.md',          'emoji': '📜'},
-    'shenyi':   {'label': '审微',   'role': '审议官',     'duty': '独立审查、准奏或封驳',            'emoji': '🔍'},
+    'shenyi':   {'label': '审微',   'role': '审议官',     'duty': '独立审查、通过或驳回',            'emoji': '🔍'},
     'paifa':    {'label': '驿使',   'role': '派发官',     'duty': '任务路由、派发到执行部门',        'emoji': '📮'},
     'wenan':    {'label': '墨卿',   'role': '文案策划',   'duty': '网站文案、品牌故事、SEO、翻译',   'emoji': '📝'},
     'daima':    {'label': '锋铸',   'role': '代码开发',   'duty': '前端开发、功能实现、性能优化',    'emoji': '⚔️'},
@@ -409,7 +409,7 @@ def deploy_soul_files():
         if src_text != dst_text:
             ws_dst.write_text(src_text, encoding='utf-8')
             deployed += 1
-        # 太子兼容：同步一份到 legacy main agent 目录
+        # 总办兼容：同步一份到 legacy main agent 目录
         if runtime_id == 'taizi':
             ag_dst = OPENCLAW_HOME / 'agents' / 'main' / 'SOUL.md'
             ag_dst.parent.mkdir(parents=True, exist_ok=True)

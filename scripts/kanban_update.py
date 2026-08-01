@@ -11,13 +11,13 @@
 
 用法:
   # 新建任务（收旨时）
-  python3 kanban_update.py create JJC-20260223-012 "任务标题" Zhongshu 中书省 中书令
+  python3 kanban_update.py create JJC-20260223-012 "任务标题" Zhongshu 规划部 规划师
 
   # 更新状态
-  python3 kanban_update.py state JJC-20260223-012 Menxia "规划方案已提交门下省"
+  python3 kanban_update.py state JJC-20260223-012 Menxia "规划方案已提交审议部"
 
   # 添加流转记录
-  python3 kanban_update.py flow JJC-20260223-012 "中书省" "门下省" "规划方案提交审核"
+  python3 kanban_update.py flow JJC-20260223-012 "规划部" "审议部" "规划方案提交审核"
 
   # 完成任务
   python3 kanban_update.py done JJC-20260223-012 "/path/to/output" "任务完成摘要"
@@ -74,10 +74,10 @@ def _load_canonical_transitions() -> dict:
 
 
 STATE_ORG_MAP = {
-    'Taizi': '太子', 'Zhongshu': '中书省', 'Menxia': '门下省',
-    'Assigned': '尚书省', 'Next': '尚书省',
-    'Doing': '执行中', 'Review': '尚书省', 'Done': '完成', 'Blocked': '阻塞',
-    'PendingConfirm': '尚书省', 'Pending': '中书省',
+    'Taizi': '总办', 'Zhongshu': '规划部', 'Menxia': '审议部',
+    'Assigned': '执行办', 'Next': '执行办',
+    'Doing': '执行中', 'Review': '执行办', 'Done': '完成', 'Blocked': '阻塞',
+    'PendingConfirm': '执行办', 'Pending': '规划部',
 }
 
 _STATE_AGENT_MAP = {
@@ -91,16 +91,23 @@ _STATE_AGENT_MAP = {
 }
 
 _ORG_AGENT_MAP = {
+    # 现代部门名
+    '内容部': 'libu', '交付汇总处': 'hubu', '开发部': 'bingbu',
+    '质控部': 'xingbu', '设计部': 'gongbu', '人力路由处': 'libu_hr',
+    '规划部': 'zhongshu', '审议部': 'menxia', '执行办': 'shangshu',
+    '总办': 'taizi', '运维组': 'zaochao',
+    # 历史古名兼容（CLI 旧参数/旧数据兜底）
     '礼部': 'libu', '户部': 'hubu', '兵部': 'bingbu',
     '刑部': 'xingbu', '工部': 'gongbu', '吏部': 'libu_hr',
     '中书省': 'zhongshu', '门下省': 'menxia', '尚书省': 'shangshu',
+    '太子': 'taizi', '钦天监': 'zaochao',
 }
 
 _AGENT_LABELS = {
-    'main': '太子', 'taizi': '太子',
-    'zhongshu': '中书省', 'menxia': '门下省', 'shangshu': '尚书省',
-    'libu': '礼部', 'hubu': '户部', 'bingbu': '兵部', 'xingbu': '刑部',
-    'gongbu': '工部', 'libu_hr': '吏部', 'zaochao': '钦天监',
+    'main': '总办', 'taizi': '总办',
+    'zhongshu': '规划部', 'menxia': '审议部', 'shangshu': '执行办',
+    'libu': '内容部', 'hubu': '交付汇总处', 'bingbu': '开发部', 'xingbu': '质控部',
+    'gongbu': '设计部', 'libu_hr': '人力路由处', 'zaochao': '运维组',
 }
 
 MAX_PROGRESS_LOG = 100  # 单任务最大进展日志条数
@@ -191,7 +198,7 @@ def find_task(tasks, task_id):
     return next((t for t in tasks if t.get('id') == task_id), None)
 
 
-# 旨意标题最低要求
+# 任务标题最低要求
 _MIN_TITLE_LEN = 6
 _JUNK_TITLES = {
     '?', '？', '好', '好的', '是', '否', '不', '不是', '对', '了解', '收到',
@@ -269,12 +276,12 @@ def _infer_agent_id_from_runtime(task=None):
 
 
 def _is_valid_task_title(title):
-    """校验标题是否足够作为一个旨意任务。"""
+    """校验标题是否足够作为一个正式任务。"""
     t = (title or '').strip()
     if len(t) < _MIN_TITLE_LEN:
-        return False, f'标题过短（{len(t)}<{_MIN_TITLE_LEN}字），疑似非旨意'
+        return False, f'标题过短（{len(t)}<{_MIN_TITLE_LEN}字），疑似非任务'
     if t.lower() in _JUNK_TITLES:
-        return False, f'标题 "{t}" 不是有效旨意'
+        return False, f'标题 "{t}" 不是有效任务'
     # 纯标点或问号
     if re.fullmatch(r'[\s?？!！.。,，…·\-—~]+', t):
         return False, '标题只有标点符号'
@@ -291,7 +298,7 @@ def cmd_create(task_id, title, state, org, official, remark=None):
     """新建任务（收旨时立即调用）"""
     # 清洗标题（剥离元数据）
     title = _sanitize_title(title)
-    # 旨意标题校验
+    # 任务标题校验
     valid, reason = _is_valid_task_title(title)
     if not valid:
         log.warning(f'⚠️ 拒绝创建 {task_id}：{reason}')
@@ -313,7 +320,7 @@ def cmd_create(task_id, title, state, org, official, remark=None):
             "org": actual_org, "state": state,
             "now": clean_remark[:60] if remark else f"已下旨，等待{actual_org}接旨",
             "eta": "-", "block": "无", "output": "", "ac": "",
-            "flow_log": [{"at": now_iso(), "from": "皇上", "to": actual_org, "remark": clean_remark}],
+            "flow_log": [{"at": now_iso(), "from": "老板", "to": actual_org, "remark": clean_remark}],
             "updatedAt": now_iso()
         })
         return tasks
@@ -350,9 +357,9 @@ else:
 
 # 需要进入 PendingConfirm 中间状态的高风险转换
 HIGH_RISK_TRANSITIONS = {
-    ('Review', 'Done'),       # 完结任务 — 需门下省确认
-    ('Doing', 'Cancelled'),   # 执行中取消 — 需尚书省确认
-    ('Menxia', 'Cancelled'),  # 审核中取消 — 需中书省确认
+    ('Review', 'Done'),       # 完结任务 — 需审议部确认
+    ('Doing', 'Cancelled'),   # 执行中取消 — 需执行办确认
+    ('Menxia', 'Cancelled'),  # 审核中取消 — 需规划部确认
 }
 
 # 各状态的确认权限方
@@ -470,7 +477,7 @@ def cmd_flow(task_id, from_dept, to_dept, remark):
 
 
 def cmd_done(task_id, output_path='', summary=''):
-    """执行部门回报完成，任务进入 Review 待尚书省汇总审查。"""
+    """执行部门回报完成，任务进入 Review 待执行办汇总审查。"""
     rejected = [False]
     reject_reason = ['']
     def modifier(tasks):
@@ -493,10 +500,10 @@ def cmd_done(task_id, output_path='', summary=''):
         t['state'] = 'Review'
         t['org'] = STATE_ORG_MAP.get('Review', t.get('org', ''))
         t['output'] = output_path
-        t['now'] = summary or '执行已完成，提交尚书省汇总审查'
+        t['now'] = summary or '执行已完成，提交执行办汇总审查'
         t.setdefault('flow_log', []).append({
             "at": now_iso(), "from": from_org,
-            "to": "尚书省", "remark": f"✅ 执行完成，提交审查：{summary or '待尚书省汇总'}"
+            "to": "执行办", "remark": f"✅ 执行完成，提交审查：{summary or '待执行办汇总'}"
         })
         # 同步设置 outputMeta，避免依赖 refresh_live_data.py 异步补充
         if output_path:
@@ -515,7 +522,7 @@ def cmd_done(task_id, output_path='', summary=''):
         log.warning(f'⚠️ {task_id} done 被拒绝：{reject_reason[0]}')
         _append_audit(task_id, _infer_agent_id_from_runtime(), 'done_rejected', None, 'Review', reject_reason[0])
         return
-    log.info(f'✅ {task_id} 执行完成，已提交尚书省审查')
+    log.info(f'✅ {task_id} 执行完成，已提交执行办审查')
     _append_audit(task_id, _infer_agent_id_from_runtime(), 'done', None, 'Review', summary or '')
     # 🔥 进化引导：提示 Agent 回顾经验
     agent_id = _infer_agent_id_from_runtime()

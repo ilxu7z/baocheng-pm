@@ -251,13 +251,13 @@ set_sched('JJC-TEST-034', retryCount=2, escalationLevel=2, rollbackCount=1,
 result = call_api(12)
 
 import subprocess
-proc = subprocess.run([sys.executable, str(BASE/'scripts'/'kanban_update.py'), 'state', 'JJC-TEST-034', 'Assigned', '准奏'],
+proc = subprocess.run([sys.executable, str(BASE/'scripts'/'kanban_update.py'), 'state', 'JJC-TEST-034', 'Assigned', '通过'],
     capture_output=True, text=True, timeout=10, cwd=str(BASE))
 
 t = get_task('JJC-TEST-034')
 if t:
     log(results_002, 'D', 'Menxia→Assigned', 'PASS' if t['state']=='Assigned' else 'FAIL', t['state'])
-    log(results_002, 'D', 'now字段有准奏', 'PASS' if '准奏' in (t.get('now') or '') else 'FAIL', t.get('now'))
+    log(results_002, 'D', 'now字段有通过', 'PASS' if '通过' in (t.get('now') or '') else 'FAIL', t.get('now'))
     log(results_002, 'D', 'retryCount保持为0', 'PASS' if t.get('_scheduler',{}).get('retryCount')==0 else 'FAIL',
         t.get('_scheduler',{}).get('retryCount'))
 

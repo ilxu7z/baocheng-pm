@@ -205,7 +205,7 @@ def auto_review_and_create_tasks(task_id, repo_dir, rule_path=None, update_kanba
     # 5. 保存 OCR 结果文件
     result_file = save_ocr_result(task_id, result)
 
-    # 6. 保存缺陷 JSON（供太子手动创建 todo 时参考）
+    # 6. 保存缺陷 JSON（供总办手动创建 todo 时参考）
     defects_file = _save_defects_json(task_id, result, created_tasks)
 
     # 7. 回写看板
@@ -224,7 +224,7 @@ def auto_review_and_create_tasks(task_id, repo_dir, rule_path=None, update_kanba
         ])
 
         # 7b. 为每个 critical/high 缺陷创建 todo 子任务
-        # todo_id 从 1 开始递增（由太子手动执行时决定 seq，此处自动创建供参考）
+        # todo_id 从 1 开始递增（由总办手动执行时决定 seq，此处自动创建供参考）
         for seq, defect in enumerate(created_tasks, start=1):
             todo_title = (
                 f"{defect['severity']}: {defect['path']}:{defect['start_line']}"

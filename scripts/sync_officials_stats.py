@@ -37,7 +37,7 @@ def _role_to_agent(role_id):
     for entry in _load_registry():
         if isinstance(entry, dict) and entry.get('courtId') == role_id:
             return entry['id']
-    # 特殊兼容：太子用 main
+    # 特殊兼容：总办用 main
     if role_id == 'taizi':
         return 'main'
     return role_id
@@ -63,17 +63,17 @@ MODEL_PRICING = {
 }
 
 OFFICIALS = [
-    {'id':'taizi',   'label':'太子',  'role':'太子',    'emoji':'🤴','rank':'储君'},
-    {'id':'zhongshu','label':'中书省','role':'中书令',  'emoji':'📜','rank':'正一品'},
-    {'id':'menxia',  'label':'门下省','role':'侍中',    'emoji':'🔍','rank':'正一品'},
-    {'id':'shangshu','label':'尚书省','role':'尚书令',  'emoji':'📮','rank':'正一品'},
-    {'id':'libu',    'label':'礼部',  'role':'礼部尚书','emoji':'📝','rank':'正二品'},
-    {'id':'hubu',    'label':'户部',  'role':'户部尚书','emoji':'💰','rank':'正二品'},
-    {'id':'bingbu',  'label':'兵部',  'role':'兵部尚书','emoji':'⚔️','rank':'正二品'},
-    {'id':'xingbu',  'label':'刑部',  'role':'刑部尚书','emoji':'⚖️','rank':'正二品'},
-    {'id':'gongbu',  'label':'工部',  'role':'工部尚书','emoji':'🔧','rank':'正二品'},
-    {'id':'libu_hr', 'label':'吏部',  'role':'吏部尚书','emoji':'👔','rank':'正二品'},
-    {'id':'zaochao', 'label':'钦天监','role':'朝报官',  'emoji':'📰','rank':'正三品'},
+    {'id':'taizi',   'label':'总办',    'role':'项目总控',    'emoji':'🤴','rank':'负责人'},
+    {'id':'zhongshu','label':'规划部',  'role':'规划师',      'emoji':'📜','rank':'负责人'},
+    {'id':'menxia',  'label':'审议部',  'role':'审议官',      'emoji':'🔍','rank':'负责人'},
+    {'id':'shangshu','label':'执行办',  'role':'执行经理',    'emoji':'📮','rank':'负责人'},
+    {'id':'libu',    'label':'内容部',  'role':'内容负责人',  'emoji':'📝','rank':'负责人'},
+    {'id':'hubu',    'label':'交付汇总处','role':'交付负责人',  'emoji':'💰','rank':'负责人'},
+    {'id':'bingbu',  'label':'开发部',  'role':'开发负责人',  'emoji':'⚔️','rank':'负责人'},
+    {'id':'xingbu',  'label':'质控部',  'role':'质控负责人',  'emoji':'⚖️','rank':'负责人'},
+    {'id':'gongbu',  'label':'设计部',  'role':'设计负责人',  'emoji':'🔧','rank':'负责人'},
+    {'id':'libu_hr', 'label':'人力路由处','role':'人力路由负责人','emoji':'👔','rank':'负责人'},
+    {'id':'zaochao', 'label':'运维组',  'role':'运维专员',     'emoji':'📰','rank':'负责人'},
 ]
 
 def rj(p, d):
@@ -209,7 +209,7 @@ def get_task_stats(org_label, tasks, alt_org=None):
     # flow_log 匹配：也用备选 org
     fl = sum(1 for t in tasks for f in t.get('flow_log',[])
              if f.get('from') in (org_label, alt_org) or f.get('to') in (org_label, alt_org))
-    # 参与的旨意（JJC）列表 — 只保留活跃（非终态）任务
+    # 参与的任务（JJC）列表 — 只保留活跃（非终态）任务
     participated = []
     matched_ids = set()
     for t in tasks:

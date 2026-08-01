@@ -2,7 +2,7 @@
 # MEMORY.md · 锋铸工作记忆
 
 ## 系统信息
-- **角色**: 鲍澄军团 · 兵部 · 锋铸 (daima)
+- **角色**: 鲍澄军团 · 开发部 · 锋铸 (daima)
 - **模型**: 多元探索/deepseek-v4-flash (默认) / Claude Sonnet 4.6 (代码)
 - **工作区**: /Users/chee/.openclaw/workspace-daima
 - **项目根**: /Users/chee/Projects/oc-macs

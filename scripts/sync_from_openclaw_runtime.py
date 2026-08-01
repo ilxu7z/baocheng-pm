@@ -90,21 +90,21 @@ def load_sessions(sessions_file: pathlib.Path):
 
 def detect_official(agent_id):
     mapping = {
-        # original 三省六部
-        'main':    ('储君', '太子'),
-        'taizi':   ('储君', '太子'),
-        'zhongshu': ('中书令', '中书省'),
-        'menxia':  ('侍中', '门下省'),
-        'shangshu': ('尚书令', '尚书省'),
-        'hubu':    ('户部尚书', '户部'),
-        'libu':    ('礼部尚书', '礼部'),
-        'bingbu':  ('兵部尚书', '兵部'),
-        'xingbu':  ('刑部尚书', '刑部'),
-        'gongbu':  ('工部尚书', '工部'),
-        'libu_hr': ('吏部尚书', '吏部'),
-        'zaochao': ('钦天监', '钦天监'),
-        # 鲍澄军团映射
-        'baocheng': ('储君', '鲍澄'),
+        # original 三省六部 →（已在现代化改名方案中映射为现代组织）
+        'main':    ('项目总控', '总办'),
+        'taizi':   ('项目总控', '总办'),
+        'zhongshu': ('规划师', '规划部'),
+        'menxia':  ('审议官', '审议部'),
+        'shangshu': ('执行经理', '执行办'),
+        'hubu':    ('交付负责人', '交付汇总处'),
+        'libu':    ('内容负责人', '内容部'),
+        'bingbu':  ('开发负责人', '开发部'),
+        'xingbu':  ('质控负责人', '质控部'),
+        'gongbu':  ('设计负责人', '设计部'),
+        'libu_hr': ('人力路由负责人', '人力路由处'),
+        'zaochao': ('运维专员', '运维组'),
+        # 鲍澄军团映射（子 Agent 体系，已用现代名）
+        'baocheng': ('项目总控', '鲍澄'),
         'guihua':  ('筹微', '三省-筹微'),
         'shenyi':  ('审微', '三省-审微'),
         'paifa':   ('驿使', '三省-驿使'),
@@ -113,10 +113,10 @@ def detect_official(agent_id):
         'sheji':   ('绘象', '三省-绘象'),
         'shencha': ('镜衡', '三省-镜衡'),
         'huizong': ('归藏', '三省-归藏'),
-        'ld-r':    ('尚书令', '尚书省'),
-        'rongcui': ('钦天监', '钦天监'),
+        'ld-r':    ('执行经理', '执行办'),
+        'rongcui': ('运维专员', '运维组'),
     }
-    return mapping.get(agent_id, ('尚书令', '尚书省'))
+    return mapping.get(agent_id, ('执行经理', '执行办'))
 
 
 def load_activity(session_file, limit=12):
@@ -360,7 +360,7 @@ def main():
             except Exception:
                 pass
 
-        # merge manual parallel tasks (用于军机处并行看板展示)
+        # merge manual parallel tasks (用于总控中心并行看板展示)
         manual_tasks_file = DATA / 'manual_parallel_tasks.json'
         if manual_tasks_file.exists():
             try:
@@ -412,7 +412,7 @@ def main():
         
         tasks = filtered_tasks
         
-        # ── 保留已有的 JJC-* 旨意任务（不覆盖皇上下旨记录）──
+        # ── 保留已有的 JJC-* 任务（不覆盖老板下达记录）──
         # JJC 任务的 now 字段由 Agent 自己通过 kanban_update.py progress 命令主动上报，
         # 不再从会话日志中被动抓取。这里只做合并，不做 activity 映射。
         existing_tasks_file = DATA / 'tasks_source.json'
@@ -422,7 +422,7 @@ def main():
                 jjc_existing = [t for t in existing if str(t.get('id', '')).startswith('JJC')]
                 
                 # 去掉 tasks 里人工下旨的 JJC 任务（以防重复），但保留 JJC-AUTO 自动发现任务
-                # dashboard 旨意看板只显示 /^JJC-/i 的任务，故自动发现也以 JJC-AUTO 前缀
+                # dashboard 任务看板只显示 /^JJC-/i 的任务，故自动发现也以 JJC-AUTO 前缀
                 tasks = [t for t in tasks if not (str(t.get('id', '')).startswith('JJC') and not str(t.get('id', '')).startswith('JJC-AUTO'))]
                 # 过滤掉已不存在的 AUTO 任务（session .jsonl 文件已删除但 sessions.json 还有僵尸条目）
                 jjc_existing = [t for t in jjc_existing if not (str(t.get('id', '')).startswith('JJC-AUTO') and not _session_file_exists(t))]

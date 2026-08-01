@@ -50,7 +50,7 @@ def sdd_spec_valid(task):
     """SDD 契约完整性校验。返回 (ok, reason)。
 
     校验：spec 存在、有 purpose/outputs、验收标准非空且无模糊词。
-    旧任务无 spec → 视为"未达标但不拦截"（由 enabled() 决定是否封驳）。
+    旧任务无 spec → 视为"未达标但不拦截"（由 enabled() 决定是否驳回）。
     """
     spec = task.get('spec')
     if not isinstance(spec, dict):
@@ -79,7 +79,7 @@ def sdd_spec_valid(task):
 def sdd_gate(task_id, task, flow_log_append):
     """SDD 契约门禁钩子（进 Review 前调用）。
 
-    enabled()=1 时：不合格 → 封驳（不推进），写 flow_log。
+    enabled()=1 时：不合格 → 驳回（不推进），写 flow_log。
     enabled()=0 时：只标记 spec_status，不拦截（过渡）。
     返回 (allow, reason)：allow=False 表示应阻止推进。
     """
@@ -91,7 +91,7 @@ def sdd_gate(task_id, task, flow_log_append):
         task['spec_status'] = 'blocked'
         flow_log_append({
             'from': 'SDD门禁', 'to': 'Zhongshu',
-            'remark': f'SDD 契约不完整，封驳回筹微：{reason}',
+            'remark': f'SDD 契约不完整，驳回规划部：{reason}',
         })
         return False, reason
     # 过渡模式：标记但不拦截
@@ -120,7 +120,7 @@ def cdd_record_injection(task, layer, knowledge_src, agent=None, spec_hash=None)
 def decomp_check(task_id, task, flow_log_append):
     """任务分解自查钩子（Menxia→Assigned 前调用）。
 
-    加载 selfcheck_engine.py 做七维评分；不达标且 enabled()=1 时生成补齐动作并封驳。
+    加载 selfcheck_engine.py 做七维评分；不达标且 enabled()=1 时生成补齐动作并驳回。
     返回 (allow, audit)：
       allow=False → 应阻止推进到 Assigned（转补齐）
       audit      → {'score', 'dims', 'verdict', 'remediation'}

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-太子巡检Bug验证测试 — 模拟Agent工作中
+总控巡检Bug验证测试 — 模拟Agent工作中
 方案: JJC-20260626-004
 """
 import json, pathlib, sys, time, datetime, subprocess, os, re
@@ -153,7 +153,7 @@ FAIL = '❌ FAIL'
 SKIP = '⏭️ SKIP'
 
 log('=' * 60)
-log('太子巡检Bug验证测试开始')
+log('总控巡检Bug验证测试开始')
 log('=' * 60)
 
 # ── 场景 A: Agent 正常工作中 ──
@@ -475,7 +475,7 @@ log('\n' + '─' * 50)
 log('场景 I (新增): Next状态任务检测 — 与Doing一致')
 log('─' * 50)
 
-ensure_task_exists('JJC-TEST-048', '巡检测试-I:Next状态检测', 'Next', '尚书省')
+ensure_task_exists('JJC-TEST-048', '巡检测试-I:Next状态检测', 'Next', '执行办')
 reset_scheduler('JJC-TEST-048')
 set_last_progress_at('JJC-TEST-048', 300)  # Within threshold
 
@@ -571,7 +571,7 @@ log(f'\n总计: {len(results)} 场景, {passed} 通过, {failed} 失败')
 
 # Write report
 report = {
-    'testName': 'JJC-20260626-004 太子巡检Bug验证-模拟Agent工作中',
+    'testName': 'JJC-20260626-004 总控巡检Bug验证-模拟Agent工作中',
     'testedAt': now_iso(),
     'total': len(results),
     'passed': passed,
@@ -587,7 +587,7 @@ log(f'\n报告已输出: {report_path}')
 # Also write markdown report
 md_path = OUTPUT_DIR / 'JJC-20260626-004-taizi-scan-test-report.md'
 md_lines = [
-    '# 太子巡检Bug验证测试报告',
+    '# 总控巡检Bug验证测试报告',
     '',
     f'**测试时间**: {now_iso()}',
     f'**测试方案**: JJC-20260626-004',
