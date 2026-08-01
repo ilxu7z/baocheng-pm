@@ -3,43 +3,43 @@
 [
   {
     "id": "guihua",
-    "name": "筹微"
+    "name": "军师"
   },
   {
     "id": "shenyi",
-    "name": "审微"
+    "name": "审计官"
   },
   {
     "id": "paifa",
-    "name": "驿使"
+    "name": "路由主管"
   },
   {
     "id": "wenan",
-    "name": "墨卿"
+    "name": "内容主管"
   },
   {
     "id": "daima",
-    "name": "锋铸"
+    "name": "研发主管"
   },
   {
     "id": "sheji",
-    "name": "绘象"
+    "name": "视觉主管"
   },
   {
     "id": "shencha",
-    "name": "镜衡"
+    "name": "品控官"
   },
   {
     "id": "huizong",
-    "name": "归藏"
+    "name": "交付主管"
   },
   {
     "id": "ld-r",
-    "name": "执行经理"
+    "name": "调度长"
   },
   {
     "id": "rongcui",
-    "name": "溶萃"
+    "name": "运维主管"
   },
   {
     "id": "main",

@@ -1,7 +1,7 @@
 <!-- version:v2.0.0-system -->
 ## Deep Sleep
 <!-- openclaw:dreaming:deep:start -->
-- 锋铸梦境日志
+- 研发主管梦境日志
 - 记录每日执行摘要、技术决策、经验教训
 <!-- openclaw:dreaming:deep:end -->
 

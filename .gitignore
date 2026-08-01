@@ -53,3 +53,7 @@ data/*.bak
 data/*.bak-*
 data/*.pre-migrate-manual
 *.bak-ancient-*
+*.bak-name-*
+
+# 方案备份
+*.bak-planB

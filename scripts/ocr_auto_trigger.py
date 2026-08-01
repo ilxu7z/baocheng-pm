@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ocr_auto_trigger.py — 锋铸完成 → 自动 OCR 审查 → 缺陷创建任务
+"""ocr_auto_trigger.py — 研发主管完成 → 自动 OCR 审查 → 缺陷创建任务
 
 审查在 state 推进到 Review 时自动触发。
 

@@ -1,5 +1,5 @@
 <!-- version:v2.0.0-system -->
-# AGENTS.md · 溶萃 (rongcui) 精简工作协议
+# AGENTS.md · 运维主管 (rongcui) 精简工作协议
 ## 治理铁律
 必须遵守 GOVERNANCE.md 全部条款。
 ## 五条决策门

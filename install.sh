@@ -565,10 +565,10 @@ write_main_agenda() {
 | 异常 | 动作 |
 |------|------|
 | 看板 API 连续 3 次 curl 失败 | 跳过看板，直接派子 Agent，事后补录 |
-| 筹微超时 10min 不返回 | 自己起草方案框架，跳过审微直接派执行 Agent |
-| 审微连续打回 3 次 | 第三次结论即为终审，直接进入执行 |
+| 军师超时 10min 不返回 | 自己起草方案框架，跳过审计官直接派执行 Agent |
+| 审计官连续打回 3 次 | 第三次结论即为终审，直接进入执行 |
 | 执行 Agent 产出不达标 | 打回一次；再次不达标自己接手补齐 |
-| 镜衡验收超时 | 自己按原标准执行验收 |
+| 品控官验收超时 | 自己按原标准执行验收 |
 
 ---
 
@@ -578,10 +578,10 @@ write_main_agenda() {
 
 ```
 1. 建看板 → curl POST /api/create-task → 获得 taskId
-2. 筹微(guihua) 起草方案 → sessions_spawn
-3. 审微(shenyi) 审核方案 → sessions_spawn
+2. 军师(guihua) 起草方案 → sessions_spawn
+3. 审计官(shenyi) 审核方案 → sessions_spawn
 4. 通过 → 派执行: 代码→daima | 文案→wenan | 设计→sheji
-   不通过 → 退回筹微修正（见下方 Fork 流程）
+   不通过 → 退回军师修正（见下方 Fork 流程）
 5. 验收(可选) → shencha
 6. 每步推进状态 → curl POST /api/advance-state
 ```
@@ -608,15 +608,15 @@ OpenClaw 2026.7.1 支持 session fork。用法矩阵：
 | 保留当前上下文探索分支 | `sessions_spawn` | `fork` |
 | 对比两种方案 | `sessions_spawn` ×2 | `fork` |
 
-### Fork 流程（审微封驳）
+### Fork 流程（审计官驳回）
 
-审微打回方案时，不要 fork 审微的 session：
+审计官打回方案时，不要 fork 审计官的 session：
 
 ```
-1. 审微返回打回意见
-2. 筹微 session 还活着 → sessions_send 转发意见让筹微修正
-   筹微已结束 → sessions_spawn(guihua) 重派，附带审微意见
-3. 筹微返回修正方案 → sessions_spawn(shenyi) 复审
+1. 审计官返回打回意见
+2. 军师 session 还活着 → sessions_send 转发意见让军师修正
+   军师已结束 → sessions_spawn(guihua) 重派，附带审计官意见
+3. 军师返回修正方案 → sessions_spawn(shenyi) 复审
 4. 仍不通过 → 降级策略（3 次打回 → 终审）
 ```
 
@@ -1898,7 +1898,7 @@ main() {
   echo "已安装的 Agent："
   echo "  规划 guihua  |  审议 shenyi  |  派发 paifa"
   echo "  文案 wenan   |  代码 daima   |  设计 sheji"
-  echo "  审查 shencha |  汇总 huizong  |  溶萃 rongcui"
+  echo "  审查 shencha |  汇总 huizong  |  运维主管 rongcui"
   echo ""
   echo "下一步："
   echo "  1. 启动数据刷新:  bash scripts/run_loop.sh &"

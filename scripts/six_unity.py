@@ -150,7 +150,7 @@ def decomp_check(task_id, task, flow_log_append):
         audit['remediation'] = rem
         task['decomp_audit']['remediation'] = rem
         flow_log_append({
-            'from': '自查引擎', 'to': '锋铸补齐',
+            'from': '自查引擎', 'to': '研发主管补齐',
             'remark': f'任务分解未达标({audit.get("score_pct", 0)}%)，生成{len(rem)}条补齐动作',
         })
         return False, audit
@@ -167,7 +167,7 @@ def se_try_extract_experience(task_id, task, flow_log_append):
     """Done 后尝试产出经验卡（异步委托，不阻塞归档）。
 
     从任务 flow_log + skill_ref 提炼一条经验卡写入 data/experience-cards.jsonl，
-    供审微评审池扫描。若任务无可提炼内容则跳过。
+    供审计官评审池扫描。若任务无可提炼内容则跳过。
     """
     title = task.get('title', '')
     skill_ref = task.get('skill_ref')
@@ -178,7 +178,7 @@ def se_try_extract_experience(task_id, task, flow_log_append):
         'state': 'done',
         'skill_refs': skill_ref if isinstance(skill_ref, list) else [],
         'ts': _now_iso(),
-        'status': 'pending_review',   # 待审微评审
+        'status': 'pending_review',   # 待审计官评审
         'source': 'six_unity_se',
     }
     try:
@@ -187,7 +187,7 @@ def se_try_extract_experience(task_id, task, flow_log_append):
             fh.write(json.dumps(card, ensure_ascii=False) + '\n')
         flow_log_append({
             'from': 'SE', 'to': '评审池',
-            'remark': f'经验卡已入评审池（待审微评审）',
+            'remark': f'经验卡已入评审池（待审计官评审）',
         })
         return card
     except Exception as e:

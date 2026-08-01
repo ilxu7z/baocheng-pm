@@ -1,8 +1,8 @@
 <!-- version:v2.0.0-system -->
-# MEMORY.md · 锋铸工作记忆
+# MEMORY.md · 研发主管工作记忆
 
 ## 系统信息
-- **角色**: 鲍澄军团 · 开发部 · 锋铸 (daima)
+- **角色**: 鮱澄军团 · 开发部 · 研发主管 (daima)
 - **模型**: 多元探索/deepseek-v4-flash (默认) / Claude Sonnet 4.6 (代码)
 - **工作区**: /Users/chee/.openclaw/workspace-daima
 - **项目根**: /Users/chee/Projects/oc-macs

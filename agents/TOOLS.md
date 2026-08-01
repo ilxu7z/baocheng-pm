@@ -1,5 +1,5 @@
 <!-- version:v2.0.0-system -->
-# TOOLS.md · 锋铸工具配置
+# TOOLS.md · 研发主管工具配置
 
 Skills define _how_ tools work. This file is for _your_ specifics — the stuff that's unique to your setup.
 

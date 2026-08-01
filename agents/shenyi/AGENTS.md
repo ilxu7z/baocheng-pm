@@ -1,5 +1,5 @@
 <!-- version:v2.0.0-system -->
-# AGENTS.md · 审微 (shenyi) 精简工作协议
+# AGENTS.md · 审计官 (shenyi) 精简工作协议
 ## 治理铁律
 必须遵守 GOVERNANCE.md 全部条款。
 ## 五条决策门

@@ -1005,7 +1005,7 @@ ORG_LEGACY_MAP = {
     '尚书省': '执行办',  '吏部': '人力路由处',  '礼部': '内容部',  '兵部': '开发部',
     '刑部': '质控部',  '工部': '设计部',  '户部': '交付汇总处',  '钦天监': '运维组',
     '六部': '执行部门',  '储君': '项目总控',  '中书令': '规划师',  '侍中': '审议官',
-    '尚书令': '执行经理',  '朝报官': '运维专员',
+    '尚书令': '调度长',  '朝报官': '运维专员',
     '礼部尚书': '内容负责人', '户部尚书': '交付负责人', '兵部尚书': '开发负责人',
     '刑部尚书': '质控负责人', '工部尚书': '设计负责人', '吏部尚书': '人力路由负责人',
 }
@@ -1023,16 +1023,16 @@ def _modern(org):
 
 _AGENT_DEPTS = [
     {'id':'taizi',   'label':ORG_MODERN['taizi'],   'emoji':'🤴', 'role':'项目总控', 'rank':'总办'},
-    {'id':'zhongshu','label':ORG_MODERN['zhongshu'],'emoji':'📜', 'role':'规划师',   'rank':'负责人'},
-    {'id':'menxia',  'label':ORG_MODERN['menxia'],  'emoji':'🔍', 'role':'审议官',   'rank':'负责人'},
-    {'id':'shangshu','label':ORG_MODERN['shangshu'],'emoji':'📮', 'role':'执行经理', 'rank':'负责人'},
-    {'id':'hubu',    'label':ORG_MODERN['hubu'],    'emoji':'💰', 'role':'交付负责人', 'rank':'负责人'},
-    {'id':'libu',    'label':ORG_MODERN['libu'],    'emoji':'📝', 'role':'内容负责人', 'rank':'负责人'},
-    {'id':'bingbu',  'label':ORG_MODERN['bingbu'],  'emoji':'⚔️', 'role':'开发负责人', 'rank':'负责人'},
-    {'id':'xingbu',  'label':ORG_MODERN['xingbu'],  'emoji':'⚖️', 'role':'质控负责人', 'rank':'负责人'},
-    {'id':'gongbu',  'label':ORG_MODERN['gongbu'],  'emoji':'🔧', 'role':'设计负责人', 'rank':'负责人'},
-    {'id':'libu_hr', 'label':ORG_MODERN['libu_hr'], 'emoji':'👔', 'role':'人力路由负责人', 'rank':'负责人'},
-    {'id':'zaochao', 'label':ORG_MODERN['zaochao'], 'emoji':'📰', 'role':'运维专员', 'rank':'负责人'},
+    {'id':'zhongshu','label':ORG_MODERN['zhongshu'],'emoji':'📜', 'role':'军师',     'rank':'负责人'},
+    {'id':'menxia',  'label':ORG_MODERN['menxia'],  'emoji':'🔍', 'role':'审计官',   'rank':'负责人'},
+    {'id':'shangshu','label':ORG_MODERN['shangshu'],'emoji':'📮', 'role':'调度长', 'rank':'负责人'},
+    {'id':'hubu',    'label':ORG_MODERN['hubu'],    'emoji':'💰', 'role':'交付主管', 'rank':'负责人'},
+    {'id':'libu',    'label':ORG_MODERN['libu'],    'emoji':'📝', 'role':'内容主管', 'rank':'负责人'},
+    {'id':'bingbu',  'label':ORG_MODERN['bingbu'],  'emoji':'⚔️', 'role':'研发主管', 'rank':'负责人'},
+    {'id':'xingbu',  'label':ORG_MODERN['xingbu'],  'emoji':'⚖️', 'role':'品控官',   'rank':'负责人'},
+    {'id':'gongbu',  'label':ORG_MODERN['gongbu'],  'emoji':'🔧', 'role':'视觉主管', 'rank':'负责人'},
+    {'id':'libu_hr', 'label':ORG_MODERN['libu_hr'], 'emoji':'👔', 'role':'路由主管', 'rank':'负责人'},
+    {'id':'zaochao', 'label':ORG_MODERN['zaochao'], 'emoji':'📰', 'role':'运维主管', 'rank':'负责人'},
 ]
 
 
@@ -3461,7 +3461,7 @@ def handle_advance_state(task_id, comment=''):
         _scheduler_mark_progress(task, f'手动推进 {cur} -> {next_state}')
         task['updatedAt'] = now_iso()
 
-        # 🔥 OCR 自动审查（异步，治本）：锋铸完成 → 审查 → critical/high 自动建 P0 任务
+        # 🔥 OCR 自动审查（异步，治本）：研发主管完成 → 审查 → critical/high 自动建 P0 任务
         # 不放在持锁回调里同步执行（避免排他锁被 OCR 慢调用长期持有→锁卡死），
         # 改为后台线程池执行，完成后短持锁回写 task['ocr_auto']。
         if next_state == 'Review':

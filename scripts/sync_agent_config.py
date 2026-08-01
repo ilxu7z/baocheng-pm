@@ -22,17 +22,17 @@ OPENCLAW_HOME = get_openclaw_home()
 OPENCLAW_CFG = OPENCLAW_HOME / 'openclaw.json'
 
 ID_LABEL = {
-    'main':     {'label': '鲍澄',   'role': '项目负责人', 'duty': '需求分析、调度决策、最终交付', 'emoji': '🏛️'},
-    'ld-r':     {'label': 'Ld.r',   'role': '执行经理',   'duty': '项目管理、方案执行、督办推进', 'emoji': '📮'},
-    'guihua':   {'label': '筹微',   'role': '规划师',     'duty': '需求拆解、生成TASK.md',          'emoji': '📜'},
-    'shenyi':   {'label': '审微',   'role': '审议官',     'duty': '独立审查、通过或驳回',            'emoji': '🔍'},
-    'paifa':    {'label': '驿使',   'role': '派发官',     'duty': '任务路由、派发到执行部门',        'emoji': '📮'},
-    'wenan':    {'label': '墨卿',   'role': '文案策划',   'duty': '网站文案、品牌故事、SEO、翻译',   'emoji': '📝'},
-    'daima':    {'label': '锋铸',   'role': '代码开发',   'duty': '前端开发、功能实现、性能优化',    'emoji': '⚔️'},
-    'sheji':    {'label': '绘象',   'role': '视觉设计',   'duty': '视觉规范、UI设计、生图',          'emoji': '🎨'},
-    'shencha':  {'label': '镜衡',   'role': '质量审查',   'duty': '独立质量验收、对照标准评分',      'emoji': '⚖️'},
-    'huizong':  {'label': '归藏',   'role': '项目汇总',   'duty': '整合交付、生成交付报告',          'emoji': '📋'},
-    'rongcui':  {'label': '溶萃',   'role': '全能工程师', 'duty': '运维部署、技术支持、特殊任务',    'emoji': '🔧'},
+    'main':     {'label': '鮱澄',   'role': '项目负责人', 'duty': '需求分析、调度决策、最终交付', 'emoji': '🏛️'},
+    'ld-r':     {'label': '调度长',   'role': '调度长',   'duty': '项目管理、方案执行、督办推进', 'emoji': '📮'},
+    'guihua':   {'label': '军师',   'role': '规划师',     'duty': '需求拆解、生成TASK.md',          'emoji': '📜'},
+    'shenyi':   {'label': '审计官',   'role': '审议官',     'duty': '独立审查、通过或驳回',            'emoji': '🔍'},
+    'paifa':    {'label': '路由主管',   'role': '派发官',     'duty': '任务路由、派发到执行部门',        'emoji': '📮'},
+    'wenan':    {'label': '内容主管',   'role': '文案策划',   'duty': '网站文案、品牌故事、SEO、翻译',   'emoji': '📝'},
+    'daima':    {'label': '研发主管',   'role': '代码开发',   'duty': '前端开发、功能实现、性能优化',    'emoji': '⚔️'},
+    'sheji':    {'label': '视觉主管',   'role': '视觉设计',   'duty': '视觉规范、UI设计、生图',          'emoji': '🎨'},
+    'shencha':  {'label': '品控官',   'role': '质量审查',   'duty': '独立质量验收、对照标准评分',      'emoji': '⚖️'},
+    'huizong':  {'label': '交付主管',   'role': '项目汇总',   'duty': '整合交付、生成交付报告',          'emoji': '📋'},
+    'rongcui':  {'label': '运维主管',   'role': '全能工程师', 'duty': '运维部署、技术支持、特殊任务',    'emoji': '🔧'},
 }
 
 # 不再维护硬编码模型列表。所有可用模型从 openclaw.json 的 defaults.models 读取，
@@ -257,7 +257,7 @@ def main():
         })
         seen_ids.add(ag_id)
 
-    # 补充不在 openclaw.json agents list 中的 agent（主会话鲍澄）
+    # 补充不在 openclaw.json agents list 中的 agent（主会话鮱澄）
     EXTRA_AGENTS = {
         'main':    {'model': default_model, 'workspace': str(OPENCLAW_HOME / 'workspace-main'),
                     'allowAgents': ['guihua','shenyi','paifa','wenan','daima','sheji','shencha','huizong']},

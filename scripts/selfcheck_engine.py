@@ -173,7 +173,7 @@ def gen_remediation(task, short_dims):
             'missing_module': desc,
             'type': rtype,
             'content': desc,
-            'owner': task.get('org', '锋铸'),
+            'owner': task.get('org', '研发主管'),
             'effort': '0.5h',
             'deadline': None,
             'acceptance': f'{d} 维度评分 >{SHORT_DIM:.0f}',

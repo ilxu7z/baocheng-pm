@@ -64,17 +64,16 @@ MODEL_PRICING = {
 
 OFFICIALS = [
     {'id':'taizi',   'label':'总办',    'role':'项目总控',    'emoji':'🤴','rank':'负责人'},
-    {'id':'zhongshu','label':'规划部',  'role':'规划师',      'emoji':'📜','rank':'负责人'},
-    {'id':'menxia',  'label':'审议部',  'role':'审议官',      'emoji':'🔍','rank':'负责人'},
-    {'id':'shangshu','label':'执行办',  'role':'执行经理',    'emoji':'📮','rank':'负责人'},
-    {'id':'libu',    'label':'内容部',  'role':'内容负责人',  'emoji':'📝','rank':'负责人'},
-    {'id':'hubu',    'label':'交付汇总处','role':'交付负责人',  'emoji':'💰','rank':'负责人'},
-    {'id':'bingbu',  'label':'开发部',  'role':'开发负责人',  'emoji':'⚔️','rank':'负责人'},
-    {'id':'xingbu',  'label':'质控部',  'role':'质控负责人',  'emoji':'⚖️','rank':'负责人'},
-    {'id':'gongbu',  'label':'设计部',  'role':'设计负责人',  'emoji':'🔧','rank':'负责人'},
-    {'id':'libu_hr', 'label':'人力路由处','role':'人力路由负责人','emoji':'👔','rank':'负责人'},
-    {'id':'zaochao', 'label':'运维组',  'role':'运维专员',     'emoji':'📰','rank':'负责人'},
-]
+    {'id':'zhongshu','label':'规划部',  'role':'军师',      'emoji':'📜','rank':'负责人'},
+    {'id':'menxia',  'label':'审议部',  'role':'审计官',      'emoji':'🔍','rank':'负责人'},
+    {'id':'shangshu','label':'执行办',  'role':'调度长',    'emoji':'📮','rank':'负责人'},
+    {'id':'libu',    'label':'内容部',  'role':'内容主管',  'emoji':'📝','rank':'负责人'},
+    {'id':'hubu',    'label':'交付汇总处','role':'交付主管',  'emoji':'💰','rank':'负责人'},
+    {'id':'bingbu',  'label':'开发部',  'role':'研发主管',  'emoji':'⚔️','rank':'负责人'},
+    {'id':'xingbu',  'label':'质控部',  'role':'品控官',  'emoji':'⚖️','rank':'负责人'},
+    {'id':'gongbu',  'label':'设计部',  'role':'视觉主管',  'emoji':'🔧','rank':'负责人'},
+    {'id':'libu_hr', 'label':'人力路由处','role':'路由主管','emoji':'👔','rank':'负责人'},
+    {'id':'zaochao', 'label':'运维组',  'role':'运维主管',     'emoji':'📰','rank':'负责人'},]
 
 def rj(p, d):
     try:
@@ -195,7 +194,7 @@ def calc_cost(s, model):
 
 def get_task_stats(org_label, tasks, alt_org=None):
     """计算该官员的任务统计。
-    alt_org 是备选 org 匹配模式（如 '三省-审微'），因为实际任务 org 不一定是官制名。
+    alt_org 是备选 org 匹配模式（如 '三省-审计官'），因为实际任务 org 不一定是官制名。
     """
     def _org_match(t):
         o = t.get('org', '')
