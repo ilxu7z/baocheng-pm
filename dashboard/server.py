@@ -15,6 +15,7 @@ Endpoints:
   GET  /api/last-result        → data/last_model_change_result.json
 """
 import json, pathlib, subprocess, sys, threading, argparse, datetime, logging, re, os, socket, shutil
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -3289,6 +3290,72 @@ def _build_six_unity_report():
     return report
 
 
+# ── OCR 异步审查（锁卡死治本）──────────────────────────────────
+# 背景：原实现把 OCR 审查放到 _do_advance 持锁回调里同步执行，
+# OCR 慢/卡→排他文件锁被长期持有→其他 create/advance 写请求全部阻塞排队
+# →表现为“锁卡死”。
+# 治本：把 OCR 移出持锁回调，提交到后台线程池执行；
+# 完成后用 modify_task 重新获取短锁写回结果，写回不阻塞推进响应。
+_OCR_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix='ocr-async')
+
+
+def _ocr_review_async_append_flow(task_id, entries):
+    """在独立事务里向指定任务追加 flow_log（OCR 后台回写用，短持锁）。"""
+    def _updater(task):
+        task.setdefault('flow_log', []).extend(entries)
+    try:
+        modify_task(task_id, _updater)
+    except Exception as e:
+        log.warning(f"OCR 异步回写 flow_log 失败 {task_id}: {e}")
+
+
+def _ocr_review_async(task_id, repo_dir):
+    """OCR 审查的后台执行体：先跑审查，再短锁回写结果。不持有推进时的排他锁。"""
+    log.info(f"[OCR-ASYNC] 入口: task={task_id} repo={repo_dir} 线程启动")
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "ocr_auto_trigger",
+            os.path.join(str(SCRIPTS), "ocr_auto_trigger.py"),
+        )
+        ocat = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ocat)
+        trigger_result = ocat.auto_review_and_create_tasks(task_id, repo_dir) or {}
+        created = trigger_result.get('tasks_created') or []
+        entries = []
+        if created:
+            entries.append({
+                'at': now_iso(),
+                'from': 'OCR',
+                'to': '缺陷',
+                'remark': (
+                    f"OCR审查发现 {trigger_result.get('critical_count', 0)}"
+                    " 个高危缺陷，已记录待创建P0任务"
+                ),
+            })
+        # 无论是否建任务都回写 ocr_auto 留痕
+        def _updater(task):
+            task.setdefault('ocr_auto', {})
+            task['ocr_auto']['triggered'] = True
+            task['ocr_auto']['created'] = created
+            task['ocr_auto']['skipped_reason'] = trigger_result.get('reason')
+            if entries:
+                task.setdefault('flow_log', []).extend(entries)
+        try:
+            modify_task(task_id, _updater)
+        except Exception as e:
+            log.warning(f"OCR 异步回写 ocr_auto 失败 {task_id}: {e}")
+        log.info(f"OCR 异步审查完成 {task_id}: created={len(created)} skip={trigger_result.get('reason')}")
+    except Exception as e:
+        log.warning(f"OCR 异步审查执行失败 {task_id}: {e}")
+        _ocr_review_async_append_flow(task_id, [{
+            'at': now_iso(),
+            'from': 'OCR',
+            'to': '(异常)',
+            'remark': f'OCR 异步审查失败: {e}',
+        }])
+
+
 def handle_advance_state(task_id, comment=''):
     """手动推进任务到下一阶段（解卡用），推进后自动派发对应 Agent。
     使用 modify_tasks 原子更新。"""
@@ -3346,36 +3413,15 @@ def handle_advance_state(task_id, comment=''):
         _scheduler_mark_progress(task, f'手动推进 {cur} -> {next_state}')
         task['updatedAt'] = now_iso()
 
-        # 🔥 OCR 自动审查：锋铸完成 → 审查 → critical/high 自动建 P0 任务
-        # 同步版，后续可改线程池（不阻塞推进响应，但审查耗时写入 task['ocr_auto']）
+        # 🔥 OCR 自动审查（异步，治本）：锋铸完成 → 审查 → critical/high 自动建 P0 任务
+        # 不放在持锁回调里同步执行（避免排他锁被 OCR 慢调用长期持有→锁卡死），
+        # 改为后台线程池执行，完成后短持锁回写 task['ocr_auto']。
         if next_state == 'Review':
+            captured_repo = task.get('repo_dir') or str(BASE.parent)
             try:
-                import importlib.util
-                spec = importlib.util.spec_from_file_location(
-                    "ocr_auto_trigger",
-                    os.path.join(str(SCRIPTS), "ocr_auto_trigger.py"),
-                )
-                ocat = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(ocat)
-                repo_dir = task.get('repo_dir') or str(BASE.parent)
-                trigger_result = ocat.auto_review_and_create_tasks(
-                    task_id, repo_dir
-                )
-                if trigger_result.get('tasks_created'):
-                    task.setdefault('ocr_auto', {})
-                    task['ocr_auto']['triggered'] = True
-                    task['ocr_auto']['created'] = trigger_result['tasks_created']
-                    task.setdefault('flow_log', []).append({
-                        'at': now_iso(),
-                        'from': 'OCR',
-                        'to': '缺陷',
-                        'remark': (
-                            f"OCR审查发现 {trigger_result['critical_count']}"
-                            " 个高危缺陷，已记录待创建P0任务"
-                        ),
-                    })
+                _OCR_EXECUTOR.submit(_ocr_review_async, task_id, captured_repo)
             except Exception as e:
-                log.warning(f"OCR 自动审查触发失败: {e}")
+                log.warning(f"OCR 异步提交失败: {e}")
 
         # ── SE 经验卡：任务 Done 后异步产出（不阻塞归档）──
         if next_state == 'Done' and _SIX_UNITY_AVAILABLE and six_unity is not None:
