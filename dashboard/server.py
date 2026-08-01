@@ -3268,6 +3268,8 @@ def dispatch_for_state(task_id, task, new_state, trigger='state-transition'):
     if skill_guidance:
         msg += '\n' + skill_guidance
     # 🔥 六合一 v2：注入 SDD 契约摘要 + CDD 协作约束（防跑偏 + 多 Agent 对齐）
+    # 提前解析真实 OpenClaw agent id，供 CDD 注入留痕记录实际接收方（可观测）
+    real_agent_id = _role_to_agent(agent_id)
     sdd_txt = _build_sdd_context(task)
     if sdd_txt:
         msg += sdd_txt
@@ -3276,7 +3278,7 @@ def dispatch_for_state(task_id, task, new_state, trigger='state-transition'):
                 _update_task_scheduler(task_id, lambda t, s: (
                     six_unity.cdd_record_injection(
                         t, layer='S', knowledge_src='sdd-contract',
-                        agent=agent_id,
+                        agent=real_agent_id,
                     ),
                     None,
                 ))
@@ -3290,7 +3292,7 @@ def dispatch_for_state(task_id, task, new_state, trigger='state-transition'):
                 _update_task_scheduler(task_id, lambda t, s: (
                     six_unity.cdd_record_injection(
                         t, layer='C', knowledge_src='cdd-collab',
-                        agent=agent_id,
+                        agent=real_agent_id,
                     ),
                     None,
                 ))
@@ -3312,7 +3314,7 @@ def dispatch_for_state(task_id, task, new_state, trigger='state-transition'):
             _update_task_scheduler(task_id, lambda t, s: (
                 six_unity.cdd_record_injection(
                     t, layer='C', knowledge_src=_final_src,
-                    agent=agent_id,
+                    agent=real_agent_id,
                 ),
                 None,
             ))
@@ -3324,7 +3326,7 @@ def dispatch_for_state(task_id, task, new_state, trigger='state-transition'):
         msg += _build_post_done_review_prompt(title, task.get('org', ''))
 
     # 角色 ID → 实际 Agent ID 翻译（三省六部 → OpenClaw）
-    real_agent_id = _role_to_agent(agent_id)
+    # real_agent_id 已在 CDD 注入留痕处提前解析；此处复用并切换 agent_id
     if real_agent_id != agent_id:
         log.info(f'🔀 dispatch 角色翻译: {agent_id} → {real_agent_id}')
         agent_id = real_agent_id
