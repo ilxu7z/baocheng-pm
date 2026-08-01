@@ -29,6 +29,13 @@ scripts_dir = str(pathlib.Path(__file__).parent.parent / 'scripts')
 sys.path.insert(0, scripts_dir)
 from file_lock import atomic_json_read, atomic_json_write, atomic_json_update
 from utils import validate_url, read_json, now_iso, python_bin, get_openclaw_home
+# 六合一融合钩子（SDD/CDD/任务分解/SE）—— SIX_UNITY 环境变量开关，默认0过渡模式
+_SIX_UNITY_AVAILABLE = False
+try:
+    import six_unity
+    _SIX_UNITY_AVAILABLE = True
+except Exception:
+    six_unity = None
 from court_discuss import (
     create_session as cd_create, advance_discussion as cd_advance,
     get_session as cd_get, conclude_session as cd_conclude,
@@ -858,6 +865,13 @@ def handle_create_task(title, org='中书省', official='中书令', priority='n
         'priority': priority,
         'templateId': template_id,
         'templateParams': params or {},
+        # ── 六合一字段（SDD/CDD/任务分解/SE，兼容旧任务 .get() 降级）──
+        'spec': None,                    # SDD 契约 {purpose,outputs,acceptance_criteria,boundaries,fri_ids,dependencies,contract_interfaces}
+        'spec_status': 'pending',        # pending|draft|reviewed|blocked
+        'cdd_injected': None,            # CDD 注入留痕 {layer,knowledge_src,spec_hash,timestamp,agent}
+        'skill_ref': None,               # SE 环④：任务引用过的 skill
+        'experience_card': None,         # SE 环①：Done 后经验卡
+        'decomp_audit': None,            # 任务分解自查 {score_pct,dims,verdict,audit_seq}
         'flow_log': [{
             'at': now_iso(),
             'from': '皇上',
@@ -3015,6 +3029,19 @@ def dispatch_for_state(task_id, task, new_state, trigger='state-transition'):
     )
     if knowledge:
         msg += '\n' + knowledge
+    # 🔥 CDD 注入留痕（可观测，证明注入了哪些上下文）
+    if _SIX_UNITY_AVAILABLE and six_unity is not None:
+        try:
+            _injected_src = 'shared-knowledge' if knowledge else ''
+            _update_task_scheduler(task_id, lambda t, s: (
+                six_unity.cdd_record_injection(
+                    t, layer='C', knowledge_src=_injected_src,
+                    agent=agent_id,
+                ),
+                None,
+            ))
+        except Exception as e:
+            log.warning(f"CDD 注入留痕失败: {e}")
 
     # 六部执行 Agent 追加: 任务完成后写经验
     if agent_id in ('libu', 'hubu', 'bingbu', 'xingbu', 'gongbu', 'libu_hr'):
@@ -3215,6 +3242,53 @@ def dispatch_for_state(task_id, task, new_state, trigger='state-transition'):
     log.info(f'🚀 {task_id} 推进后自动派发 → {agent_id}')
 
 
+def _build_six_unity_report():
+    """六合一可观测审计：统计各柱子留痕，证明'真的触发了'。"""
+    tasks = load_tasks()
+    total = len(tasks)
+    report = {
+        'enabled': _SIX_UNITY_AVAILABLE and six_unity is not None,
+        'hook_loaded': _SIX_UNITY_AVAILABLE and six_unity is not None,
+        'sdd_enforce': (six_unity.enabled() if six_unity else False),
+        'total_tasks': total,
+        'pillars': {
+            'SDD契约': {'spec_present': 0, 'spec_reviewed': 0, 'spec_blocked': 0},
+            'CDD注入': {'injected': 0},
+            '任务分解': {'audited': 0, 'passed': 0, 'blocked': 0},
+            'ORC审查': {'triggered': 0},
+            'SE经验': {'cards': 0},
+        },
+        'experience_cards_file': str(DATA / 'experience-cards.jsonl'),
+    }
+    for t in tasks:
+        if t.get('spec'):
+            report['pillars']['SDD契约']['spec_present'] += 1
+            status = t.get('spec_status')
+            if status == 'reviewed':
+                report['pillars']['SDD契约']['spec_reviewed'] += 1
+            elif status == 'blocked':
+                report['pillars']['SDD契约']['spec_blocked'] += 1
+        if t.get('cdd_injected'):
+            report['pillars']['CDD注入']['injected'] += 1
+        da = t.get('decomp_audit')
+        if da:
+            report['pillars']['任务分解']['audited'] += 1
+            if da.get('verdict') == 'pass':
+                report['pillars']['任务分解']['passed'] += 1
+            else:
+                report['pillars']['任务分解']['blocked'] += 1
+        if t.get('ocr_auto'):
+            report['pillars']['ORC审查']['triggered'] += 1
+    # SE 经验卡计数（读 jsonl）
+    try:
+        ef = DATA / 'experience-cards.jsonl'
+        if ef.exists():
+            report['pillars']['SE经验']['cards'] = sum(1 for _ in ef.open(encoding='utf-8'))
+    except Exception:
+        pass
+    return report
+
+
 def handle_advance_state(task_id, comment=''):
     """手动推进任务到下一阶段（解卡用），推进后自动派发对应 Agent。
     使用 modify_tasks 原子更新。"""
@@ -3236,10 +3310,35 @@ def handle_advance_state(task_id, comment=''):
         next_state, from_dept, to_dept, default_remark = _STATE_FLOW[cur]
         remark = comment or default_remark
 
+        # ── 六合一门禁钩子（SIX_UNITY 开关，默认过渡模式只留痕不拦截）──
+        def _append_flow(entry):
+            entry.setdefault('at', now_iso())
+            task.setdefault('flow_log', []).append(entry)
+
+        if _SIX_UNITY_AVAILABLE and six_unity is not None:
+            # ① SDD 契约门禁：进 Review 前校验 spec 契约完整
+            if next_state == 'Review':
+                _allow_sdd, _why_sdd = six_unity.sdd_gate(task_id, task, _append_flow)
+                if not _allow_sdd:
+                    result = {'ok': False, 'error': f'SDD 契约不完整，封驳回筹微：{_why_sdd}'}
+                    _scheduler_mark_progress(task, f'SDD门禁封驳: {_why_sdd}')
+                    task['updatedAt'] = now_iso()
+                    return tasks
+
+            # ③ 任务分解自查：Menxia → Assigned 时触发七维评分
+            if cur == 'Menxia' and next_state == 'Assigned':
+                _allow_decomp, _audit_decomp = six_unity.decomp_check(task_id, task, _append_flow)
+                if not _allow_decomp:
+                    result = {'ok': False, 'error': f'任务分解未达标({_audit_decomp.get("score_pct")}%)，转补齐'}
+                    # 标记为补齐中（复用 block 字段，不新增状态）
+                    task['block'] = '任务分解补齐中'
+                    _scheduler_mark_progress(task, f'任务分解未达标，转补齐')
+                    task['updatedAt'] = now_iso()
+                    return tasks
+
         task['state'] = next_state
         task['now'] = f'⬇️ 手动推进：{remark}'
-        task.setdefault('flow_log', []).append({
-            'at': now_iso(),
+        _append_flow({
             'from': from_dept,
             'to': to_dept,
             'remark': f'⬇️ 手动推进：{remark}'
@@ -3277,6 +3376,13 @@ def handle_advance_state(task_id, comment=''):
                     })
             except Exception as e:
                 log.warning(f"OCR 自动审查触发失败: {e}")
+
+        # ── SE 经验卡：任务 Done 后异步产出（不阻塞归档）──
+        if next_state == 'Done' and _SIX_UNITY_AVAILABLE and six_unity is not None:
+            try:
+                six_unity.se_try_extract_experience(task_id, task, _append_flow)
+            except Exception as e:
+                log.warning(f"SE 经验卡产出失败: {e}")
 
         if next_state != 'Done':
             dispatch_needed = True
@@ -3407,6 +3513,9 @@ class Handler(BaseHTTPRequestHandler):
         elif p == '/api/live-status':
             task_data_dir = get_task_data_dir()
             self.send_json(_cache_read_json(task_data_dir / 'live_status.json'))
+        elif p == '/api/six-unity':
+            # 六合一可观测审计端点：汇总各柱子留痕统计
+            self.send_json(_build_six_unity_report())
         elif p == '/api/agent-config':
             self.send_json(_cache_read_json(DATA / 'agent_config.json'))
         elif p == '/api/model-change-log':

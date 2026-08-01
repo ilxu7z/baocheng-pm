@@ -46,3 +46,7 @@ plans/
 scripts/memos-embed-repair.js
 data/ocr_results/
 data/ocr_dedup_cache.json
+data/audit/
+data/experience-cards.jsonl
+data/tasks_archive.json
+data/*.bak-*
