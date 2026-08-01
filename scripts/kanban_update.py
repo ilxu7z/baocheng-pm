@@ -363,8 +363,11 @@ CONFIRM_AUTHORITY = {
 }
 
 
-def cmd_state(task_id, new_state, now_text=None):
-    """更新任务状态（原子操作，含流转合法性校验 + 高风险拦截）"""
+def cmd_state(task_id, new_state, now_text=None, repo_dir=None):
+    """更新任务状态（原子操作，含流转合法性校验 + 高风险拦截 + Review 半自动 OCR 触发）
+
+    repo_dir: 可选，当 new_state=Review 时，用于半自动触发 OCR 审查
+    """
     old_state = [None]
     rejected = [False]
     pending_confirm = [False]
@@ -394,11 +397,37 @@ def cmd_state(task_id, new_state, now_text=None):
             t.setdefault('_scheduler', {})['lastProgressAt'] = now_iso()
             pending_confirm[0] = True
             return tasks
+        if new_state == 'Review':
+            # 半自动触发：检测任务数据中是否有 repo_dir 字段
+            t_repo_dir = t.get('repo_dir', '') or (repo_dir or '')
+            if t_repo_dir:
+                # 异步 spawn OCR 审查（独立子进程，不阻塞状态推进）
+                ocr_script = _BASE / 'scripts' / 'ocr_auto_trigger.py'
+                try:
+                    subprocess.Popen(
+                        [python_bin(), str(ocr_script),
+                         task_id, '--repo', t_repo_dir, '--update-kanban'],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        cwd=str(_BASE),
+                    )
+                    log.info(f'🔍 {task_id} 已异步触发 OCR 审查 (repo={t_repo_dir})')
+                except Exception as e:
+                    log.warning(f'⚠️ {task_id} OCR 触发失败: {e}')
+            else:
+                log.info(f'📋 {task_id} 已进入 Review，无 repo_dir 字段，跳过 OCR 自动触发')
+                print(f'\n[看板] 任务 {task_id} 已进入 Review 状态。', flush=True)
+                print(f'[看板] 建议执行 OCR 审查：', flush=True)
+                print(f'  python3 scripts/ocr_auto_trigger.py {task_id} --repo {{repo_dir}} --update-kanban', flush=True)
+                print(f'[看板] （将 {{repo_dir}} 替换为实际仓库目录，或跳过 OCR 审查）', flush=True)
         t['state'] = new_state
         if new_state in STATE_ORG_MAP:
             t['org'] = STATE_ORG_MAP[new_state]
         if now_text:
             t['now'] = now_text
+        # 保存 repo_dir 到任务数据（供 Review 触发 OCR 使用）
+        if repo_dir:
+            t['repo_dir'] = repo_dir
         t['updatedAt'] = now_iso()
         t.setdefault('_scheduler', {})['lastProgressAt'] = now_iso()
         return tasks
@@ -976,7 +1005,21 @@ if __name__ == '__main__':
     if cmd == 'create':
         cmd_create(args[1], args[2], args[3], args[4], args[5], args[6] if len(args)>6 else None)
     elif cmd == 'state':
-        cmd_state(args[1], args[2], args[3] if len(args)>3 else None)
+        # 解析可选 --repo-dir 参数
+        state_pos = []
+        state_repo_dir = None
+        si = 1
+        while si < len(args):
+            if args[si] == '--repo-dir' and si + 1 < len(args):
+                state_repo_dir = args[si + 1]; si += 2
+            else:
+                state_pos.append(args[si]); si += 1
+        cmd_state(
+            state_pos[0] if len(state_pos) > 0 else '',
+            state_pos[1] if len(state_pos) > 1 else '',
+            state_pos[2] if len(state_pos) > 2 else None,
+            repo_dir=state_repo_dir,
+        )
     elif cmd == 'flow':
         cmd_flow(args[1], args[2], args[3], args[4])
     elif cmd == 'done':

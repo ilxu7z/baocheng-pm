@@ -45,3 +45,4 @@ data/task_memory/
 plans/
 scripts/memos-embed-repair.js
 data/ocr_results/
+data/ocr_dedup_cache.json
