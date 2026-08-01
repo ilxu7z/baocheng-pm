@@ -2382,7 +2382,7 @@ function renderSessionsMapping(data){
       const statusIcon = s.status === 'done' || s.status === 'completed' ? '✅' :
         s.status === 'running' || s.status === 'active' ? '🔄' :
         s.status === 'timeout' ? '⏰' : '❓';
-      const timeStr = s.updatedAt ? (s.updatedAt.substring(11,19) || s.updatedAt) : '-';
+      const timeStr = (function(){ const u=s.updatedAt; if(u==null) return '-'; if(typeof u==='number'){ return new Date(u>1e12?u:u*1000).toISOString().substring(11,19); } const su=String(u); return su.substring(11,19)||su; })();
       html += '<div style="display:flex;align-items:center;gap:8px;padding:6px 8px;background:var(--panel2);border-radius:7px;font-size:12px">';
       html += '<span style="flex-shrink:0">' + statusIcon + '</span>';
       html += '<span style="font-weight:600;min-width:80px">' + esc(s.label || s.agentId || s.key) + '</span>';

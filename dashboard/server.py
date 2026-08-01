@@ -1175,6 +1175,26 @@ def _set_sessions_cache(value):
     _SESSIONS_CACHE['sessions_mapping'] = {'value': value, 'ts': datetime.datetime.now()}
 
 
+def _epoch_to_iso_ts(ts):
+    """把 updatedAt/lastActivity 统一为 UTC ISO 字符串（末尾 Z）。
+    OpenClaw sessions list --json 的 updatedAt 是 epoch 毫秒 int（如 1785586731447），
+    前端期望字符串格式。数字/字符串/其他类型均安全处理。"""
+    if ts is None:
+        return ''
+    if isinstance(ts, (int, float)):
+        try:
+            if ts > 1e12:  # 毫秒
+                sec = ts / 1000.0
+            else:          # 秒
+                sec = float(ts)
+            return datetime.datetime.fromtimestamp(sec, datetime.timezone.utc).isoformat().replace('+00:00', 'Z')
+        except Exception:
+            return ''
+    if isinstance(ts, str):
+        return ts
+    return str(ts)
+
+
 def get_sessions_mapping():
     """获取任务→Session 映射。
     调用 openclaw sessions list 命令获取 session 列表，
@@ -1245,7 +1265,7 @@ def get_sessions_mapping():
         label = s.get('label', '')
         display_name = s.get('displayName', '')
         status = s.get('status', s.get('state', 'unknown'))
-        updated_at = s.get('updatedAt', s.get('lastActivity', ''))
+        updated_at = _epoch_to_iso_ts(s.get('updatedAt', s.get('lastActivity', '')))
         spawned_by = s.get('spawnedBy', '')
         parent_key = s.get('parentSessionKey', '')
         title = s.get('title', '')
@@ -3008,6 +3028,91 @@ def _build_post_done_review_prompt(task_title='', task_org=''):
     )
 
 
+# ── 部门 → 推荐技能映射（技能全局共用后，指引 Agent 接到任务时用上对应技能）──
+# org 为部门现代名/古名，agent_id 为子 Agent id；标题匹配用于销售/B2B 类任务
+_DEPT_SKILLS = {
+    # real Agent id（registry.json）→ 推荐技能
+    'daima':   ['github', 'sdd-writer', 'ai-project-docs'],
+    'wenan':   ['b2b-client-development', 'b2b-sales-methodology', 'ai-brochure-generation'],
+    'sheji':   ['ai-brochure-generation', 'image-generation'],
+    'shenyi':  ['mll-review', 'receiving-code-review'],
+    'shencha': ['mll-review', 'skill-distiller'],
+    'guihua':  ['sdd-writer', 'ai-project-docs', 'writing-plans'],
+    'paifa':   ['dispatching-parallel-agents', 'multi-agent-cn'],
+    'huizong': ['finishing-a-development-branch'],
+    'rongcui': ['healthcheck'],
+    'ld-r':    ['executing-plans', 'writing-plans'],
+    # 部门角色 id（dispatch_for_state 派发实际用的 _ORG_AGENT_MAP 值）→ 推荐技能
+    'bingbu':    ['github', 'sdd-writer', 'ai-project-docs'],
+    'gongbu':    ['ai-brochure-generation', 'image-generation'],
+    'libu':      ['b2b-client-development', 'b2b-sales-methodology', 'ai-brochure-generation'],
+    'libu_hr':   ['dispatching-parallel-agents', 'multi-agent-cn'],
+    'hubu':      ['finishing-a-development-branch'],
+    'xingbu':    ['mll-review', 'skill-distiller'],
+    'zhongshu':  ['sdd-writer', 'ai-project-docs', 'writing-plans'],
+    'menxia':    ['mll-review', 'receiving-code-review'],
+    'shangshu':  ['executing-plans', 'writing-plans'],
+    'zaochao':   ['healthcheck'],
+    # org 部门现代名/古名 → 推荐技能
+    '开发部':   ['github', 'sdd-writer', 'ai-project-docs'],
+    '兵部':     ['github', 'sdd-writer', 'ai-project-docs'],
+    '内容部':   ['b2b-client-development', 'b2b-sales-methodology', 'ai-brochure-generation'],
+    '礼部':     ['b2b-client-development', 'b2b-sales-methodology', 'ai-brochure-generation'],
+    '设计部':   ['ai-brochure-generation', 'image-generation'],
+    '工部':     ['ai-brochure-generation', 'image-generation'],
+    '审议部':   ['mll-review', 'receiving-code-review'],
+    '门下省':   ['mll-review', 'receiving-code-review'],
+    '质控部':   ['mll-review', 'skill-distiller'],
+    '刑部':     ['mll-review', 'skill-distiller'],
+    '规划部':   ['sdd-writer', 'ai-project-docs', 'writing-plans'],
+    '中书省':   ['sdd-writer', 'ai-project-docs', 'writing-plans'],
+    '人力路由处': ['dispatching-parallel-agents', 'multi-agent-cn'],
+    '吏部':     ['dispatching-parallel-agents', 'multi-agent-cn'],
+    '交付汇总处': ['finishing-a-development-branch'],
+    '户部':     ['finishing-a-development-branch'],
+    '运维组':   ['healthcheck'],
+    '钦天监':   ['healthcheck'],
+    '执行办':   ['executing-plans', 'writing-plans'],
+    '尚书省':   ['executing-plans', 'writing-plans'],
+}
+# 标题关键词 → 推荐技能（销售/B2B/贸易/商务类任务）
+_TITLE_SKILL_KEYWORDS = [
+    (['b2b', 'sale', '销售', '商务', '客户', '谈判'], ['b2b-sales-negotiation', 'b2b-sales-methodology']),
+    (['trade', '贸易', '跟单', '订单', '进出口'], ['b2b-trade-tools', 'b2b-trade-workflow']),
+    (['brochure', '宣传册', '画册', '产品手册'], ['ai-brochure-generation']),
+    (['文档', '架构', '方案'], ['ai-project-docs', 'sdd-writer']),
+]
+
+
+def _build_skill_guidance(agent_id='', task_org='', task_title=''):
+    """根据部门/Agent/任务标题生成『推荐技能』提示，注入派发消息，确保 Agent 用上对应技能。
+    技能已在全局池（openclaw-managed）对所有 Agent 共用，此处仅做任务时引导。"""
+    skills = []
+    # 1. 先按 agent_id / org 精确匹配
+    for key in (agent_id, task_org):
+        if key in _DEPT_SKILLS:
+            skills.extend(_DEPT_SKILLS[key])
+    # 2. 再按标题关键词匹配（销售/贸易/文档类任务）
+    if not skills:
+        combined = f'{task_title} {task_org}'.lower()
+        for kws, sk_list in _TITLE_SKILL_KEYWORDS:
+            if any(kw in combined for kw in kws):
+                skills.extend(sk_list)
+                break
+    # 3. 去重保序
+    seen = set()
+    uniq = []
+    for s in skills:
+        if s not in seen:
+            seen.add(s)
+            uniq.append(s)
+    if not uniq:
+        return ''
+    names = '、'.join(f'`{s}`' for s in uniq)
+    return (f'\n🧠 **本任务推荐技能（全局共用，请优先使用）**：{names}\n'
+            f'      这些技能已在系统全局可用，处理本任务时请主动读取并调用对应 SKILL.md，避免凭直觉硬做。')
+
+
 def dispatch_for_state(task_id, task, new_state, trigger='state-transition'):
     """推进/审批后自动派发对应 Agent（后台异步，不阻塞响应）。"""
     agent_id = _STATE_AGENT_MAP.get(new_state)
@@ -3078,10 +3183,20 @@ def dispatch_for_state(task_id, task, new_state, trigger='state-transition'):
     )
     if knowledge:
         msg += '\n' + knowledge
+    # 🔥 注入推荐技能引导（确保 Agent 接到任务时用上对应技能）
+    skill_guidance = _build_skill_guidance(
+        agent_id=agent_id,
+        task_org=task.get('org', ''),
+        task_title=title,
+    )
+    if skill_guidance:
+        msg += '\n' + skill_guidance
     # 🔥 CDD 注入留痕（可观测，证明注入了哪些上下文）
     if _SIX_UNITY_AVAILABLE and six_unity is not None:
         try:
             _injected_src = 'shared-knowledge' if knowledge else ''
+            if skill_guidance:
+                _injected_src += (' + skill-guidance' if _injected_src else 'skill-guidance')
             _update_task_scheduler(task_id, lambda t, s: (
                 six_unity.cdd_record_injection(
                     t, layer='C', knowledge_src=_injected_src,
