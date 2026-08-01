@@ -1,13 +1,101 @@
 [
-  {"id": "main",    "name": "鲍澄", "role": "太子",     "duty": "总揽全局、调度决策、质检",     "emoji": "🤴", "courtId": "taizi",    "courtTitle": "太子"},
-  {"id": "ld-r",    "name": "Ld.r", "role": "执行经理",  "duty": "项目管理、方案执行、督办推进",  "emoji": "📮", "courtId": "shangshu", "courtTitle": "尚书省"},
-  {"id": "guihua",  "name": "筹微", "role": "规划师",    "duty": "需求拆解、生成TASK.md",        "emoji": "📜", "courtId": "zhongshu", "courtTitle": "中书省"},
-  {"id": "shenyi",  "name": "审微", "role": "审议官",    "duty": "独立审查、准奏或封驳",          "emoji": "🔍", "courtId": "menxia",   "courtTitle": "门下省"},
-  {"id": "paifa",   "name": "驿使", "role": "派发官",    "duty": "任务路由、派发到执行部门",       "emoji": "📮", "courtId": "libu_hr",  "courtTitle": "吏部"},
-  {"id": "wenan",   "name": "墨卿", "role": "文案策划",   "duty": "网站文案、品牌故事、SEO、翻译",  "emoji": "📝", "courtId": "libu",     "courtTitle": "礼部"},
-  {"id": "daima",   "name": "锋铸", "role": "代码开发",   "duty": "前端开发、功能实现、性能优化",   "emoji": "⚔️", "courtId": "bingbu",   "courtTitle": "兵部"},
-  {"id": "sheji",   "name": "绘象", "role": "视觉设计",   "duty": "视觉规范、UI设计、生图",         "emoji": "🎨", "courtId": "gongbu",   "courtTitle": "工部"},
-  {"id": "shencha", "name": "镜衡", "role": "质量审查",   "duty": "独立质量验收、对照标准评分",     "emoji": "⚖️", "courtId": "xingbu",   "courtTitle": "刑部"},
-  {"id": "huizong", "name": "归藏", "role": "项目汇总",   "duty": "整合交付、生成交付报告",         "emoji": "📋", "courtId": "hubu",     "courtTitle": "户部"},
-  {"id": "rongcui", "name": "溶萃", "role": "全能工程师", "duty": "运维部署、技术支持、特殊任务",   "emoji": "🔧", "courtId": "zaochao",  "courtTitle": "钦天监"}
+  {
+    "id": "main",
+    "name": "鮱澄",
+    "role": "总控调度",
+    "duty": "总揽全局、任务调度、质量把控",
+    "emoji": "🤴",
+    "courtId": "taizi",
+    "courtTitle": "总办"
+  },
+  {
+    "id": "ld-r",
+    "name": "执行经理",
+    "role": "执行经理",
+    "duty": "项目管理、方案执行、督办推进",
+    "emoji": "📮",
+    "courtId": "shangshu",
+    "courtTitle": "执行办"
+  },
+  {
+    "id": "guihua",
+    "name": "筹微",
+    "role": "规划师",
+    "duty": "需求拆解、生成任务方案",
+    "emoji": "📜",
+    "courtId": "zhongshu",
+    "courtTitle": "规划部"
+  },
+  {
+    "id": "shenyi",
+    "name": "审微",
+    "role": "审议官",
+    "duty": "独立审查、通过或驳回",
+    "emoji": "🔍",
+    "courtId": "menxia",
+    "courtTitle": "审议部"
+  },
+  {
+    "id": "paifa",
+    "name": "驿使",
+    "role": "派发官",
+    "duty": "任务路由、派发到执行部门",
+    "emoji": "📮",
+    "courtId": "libu_hr",
+    "courtTitle": "人力路由处"
+  },
+  {
+    "id": "wenan",
+    "name": "墨卿",
+    "role": "文案策划",
+    "duty": "网站文案、品牌故事、SEO、翻译",
+    "emoji": "📝",
+    "courtId": "libu",
+    "courtTitle": "内容部"
+  },
+  {
+    "id": "daima",
+    "name": "锋铸",
+    "role": "代码开发",
+    "duty": "前端开发、功能实现、性能优化",
+    "emoji": "⚔️",
+    "courtId": "bingbu",
+    "courtTitle": "开发部"
+  },
+  {
+    "id": "sheji",
+    "name": "绘象",
+    "role": "视觉设计",
+    "duty": "视觉规范、UI设计、生图",
+    "emoji": "🎨",
+    "courtId": "gongbu",
+    "courtTitle": "设计部"
+  },
+  {
+    "id": "shencha",
+    "name": "镜衡",
+    "role": "质量审查",
+    "duty": "独立质量验收、对照标准评分",
+    "emoji": "⚖️",
+    "courtId": "xingbu",
+    "courtTitle": "质控部"
+  },
+  {
+    "id": "huizong",
+    "name": "归藏",
+    "role": "项目汇总",
+    "duty": "整合交付、生成交付报告",
+    "emoji": "📋",
+    "courtId": "hubu",
+    "courtTitle": "交付汇总处"
+  },
+  {
+    "id": "rongcui",
+    "name": "溶萃",
+    "role": "运维工程师",
+    "duty": "运维部署、技术支持、特殊任务",
+    "emoji": "🔧",
+    "courtId": "zaochao",
+    "courtTitle": "运维组"
+  }
 ]

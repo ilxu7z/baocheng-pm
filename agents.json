@@ -1,12 +1,48 @@
 # 鲍澄项目管理体系 - agent 配置模板
 # 此文件为参考模板，实际安装时 install.sh 从 registry.json 动态生成
 [
-  {"id": "guihua",  "name": "筹微"},
-  {"id": "shenyi",  "name": "审微"},
-  {"id": "paifa",   "name": "驿使"},
-  {"id": "wenan",   "name": "墨卿"},
-  {"id": "daima",   "name": "锋铸"},
-  {"id": "sheji",   "name": "绘象"},
-  {"id": "shencha", "name": "镜衡"},
-  {"id": "huizong", "name": "归藏"}
+  {
+    "id": "guihua",
+    "name": "筹微"
+  },
+  {
+    "id": "shenyi",
+    "name": "审微"
+  },
+  {
+    "id": "paifa",
+    "name": "驿使"
+  },
+  {
+    "id": "wenan",
+    "name": "墨卿"
+  },
+  {
+    "id": "daima",
+    "name": "锋铸"
+  },
+  {
+    "id": "sheji",
+    "name": "绘象"
+  },
+  {
+    "id": "shencha",
+    "name": "镜衡"
+  },
+  {
+    "id": "huizong",
+    "name": "归藏"
+  },
+  {
+    "id": "ld-r",
+    "name": "执行经理"
+  },
+  {
+    "id": "rongcui",
+    "name": "溶萃"
+  },
+  {
+    "id": "main",
+    "name": "鮱澄"
+  }
 ]

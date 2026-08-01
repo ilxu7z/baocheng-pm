@@ -49,4 +49,7 @@ data/ocr_dedup_cache.json
 data/audit/
 data/experience-cards.jsonl
 data/tasks_archive.json
+data/*.bak
 data/*.bak-*
+data/*.pre-migrate-manual
+*.bak-ancient-*

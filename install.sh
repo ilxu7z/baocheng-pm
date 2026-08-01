@@ -669,7 +669,7 @@ write_main_soul() {
 
 ## 你是谁
 
-你是鲍澄（太子），八位 Agent 统领者。
+你是鲍澄（总办），八位 Agent 统领者。
 你是三省六部制的中枢调度者，用 OpenClaw session 驱动八位子 Agent 协同工作。
 
 ## ⛔ 第一铁律：诚实 > 讨好
@@ -1507,7 +1507,7 @@ repo_dir = os.environ.get('EDICT_HOME', str(pathlib.Path.cwd()))
 reg_path = pathlib.Path(repo_dir) / 'registry.json'
 if reg_path.exists():
     reg = json.loads(reg_path.read_text())
-    AGENTS = [{"id": a["id"], "subagents": {"allowAgents": []}} for a in reg]
+    AGENTS = [{"id": a["id"], "name": a.get("name", a["id"]), "role": a.get("role", ""), "emoji": a.get("emoji", "🤖"), "subagents": {"allowAgents": []}} for a in reg]
 else:
     AGENTS = []
 
@@ -1520,10 +1520,17 @@ for ag in AGENTS:
     ag_id = ag['id']
     ws = str(oc_home / f'workspace-{ag_id}')
     if ag_id not in existing_ids:
-        entry = {'id': ag_id, 'workspace': ws, 'subagents': ag.get('subagents', {'allowAgents': []})}
+        # 新注册 agent 时写入现代显示名（identity.name），避免安装后为匿名 id
+        entry = {
+            'id': ag_id,
+            'workspace': ws,
+            'name': ag.get('name', ag_id),
+            'identity': {'name': ag.get('name', ag_id), 'emoji': ag.get('emoji', '🤖')},
+            'subagents': ag.get('subagents', {'allowAgents': []})
+        }
         agents_list.append(entry)
         added += 1
-        print(f'  + 已注册: {ag_id}')
+        print(f'  + 已注册: {ag_id} (identity.name={ag.get("name", ag_id)})')
     else:
         print(f'  ~ 已存在: {ag_id}（跳过）')
 
