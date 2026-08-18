@@ -1,0 +1,4785 @@
+#!/usr/bin/env python3
+"""
+三省六部 · 看板本地 API 服务器
+Port: 7891 (可通过 --port 修改)
+
+Endpoints:
+  GET  /                       → dashboard.html
+  GET  /provider-keys          → provider-keys.html (API Key 管理)
+  GET  /api/live-status        → data/live_status.json
+  GET  /api/agent-config       → data/agent_config.json
+  GET  /api/provider-keys      → 列出所有 Provider 及脱敏密钥（模型从 defaults.models 读取）
+  POST /api/provider-key       → 更新 Provider API Key
+  POST /api/set-model          → {agentId, model}
+  GET  /api/model-change-log   → data/model_change_log.json
+  GET  /api/last-result        → data/last_model_change_result.json
+"""
+import json, pathlib, subprocess, sys, threading, argparse, datetime, logging, re, os, socket, shutil
+from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
+
+# JWT 认证模块
+from auth import init as auth_init, requires_auth, extract_token, verify_token, verify_api_token, \
+    is_enabled as auth_enabled, is_configured as auth_configured, \
+    setup_password, verify_password, create_token
+
+# 引入文件锁工具，确保与其他脚本并发安全
+scripts_dir = str(pathlib.Path(__file__).parent.parent / 'scripts')
+sys.path.insert(0, scripts_dir)
+from file_lock import atomic_json_read, atomic_json_write, atomic_json_update
+from utils import validate_url, read_json, now_iso, python_bin, get_openclaw_home
+# 六合一融合钩子（SDD/CDD/任务分解/SE）—— SIX_UNITY 环境变量开关，默认0过渡模式
+_SIX_UNITY_AVAILABLE = False
+try:
+    import six_unity
+    _SIX_UNITY_AVAILABLE = True
+except Exception:
+    six_unity = None
+from court_discuss import (
+    create_session as cd_create, advance_discussion as cd_advance,
+    get_session as cd_get, conclude_session as cd_conclude,
+    list_sessions as cd_list, destroy_session as cd_destroy,
+    get_fate_event as cd_fate, OFFICIAL_PROFILES as CD_PROFILES,
+)
+
+log = logging.getLogger('server')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(message)s', datefmt='%H:%M:%S')
+
+CHANNELS_DIR = pathlib.Path(__file__).parent.parent / 'edict' / 'backend' / 'app' / 'channels'
+if str(CHANNELS_DIR.parent) not in sys.path:
+    sys.path.insert(0, str(CHANNELS_DIR.parent))
+from channels import get_channel, get_channel_info, CHANNELS as NOTIFICATION_CHANNELS
+
+# ── 派发超时配置 ──
+# openclaw agent 正常应在 30s 内完成，但复杂任务可能需要更久
+# 120s 足够覆盖绝大多数场景，同时避免僵尸进程无限挂起
+DISPATCH_AGENT_TIMEOUT = 120  # 秒
+DISPATCH_CLEANUP_TIMEOUT = 30  # 清理线程超时：确认进程启动后快速清理，避免 8 次 TimeoutExpired
+
+# ── 内存缓存（减少磁盘 I/O）──
+_CACHE = {}
+_CACHE_TTL = 2.0  # 秒
+
+def _cache_get(key):
+    """获取缓存，过期返回 None"""
+    entry = _CACHE.get(key)
+    if entry and (datetime.datetime.now() - entry['ts']).total_seconds() < _CACHE_TTL:
+        return entry['value']
+    return None
+
+def _cache_set(key, value):
+    _CACHE[key] = {'value': value, 'ts': datetime.datetime.now()}
+
+def _cache_read_json(path, default=None):
+    """带缓存的 JSON 读取"""
+    key = str(path)
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+    value = read_json(path, default)
+    _cache_set(key, value)
+    return value
+
+OCLAW_HOME = pathlib.Path.home() / '.openclaw'
+MAX_REQUEST_BODY = 1 * 1024 * 1024  # 1 MB
+ALLOWED_ORIGIN = '*'  # Allow LAN access
+_DASHBOARD_PORT = 7891  # Updated at startup from --port arg
+_DEFAULT_ORIGINS = {
+    'http://127.0.0.1:7891', 'http://localhost:7891',
+    'http://127.0.0.1:5173', 'http://localhost:5173',  # Vite dev server
+    'http://192.168.3.180:7891',  # LAN
+}
+_SAFE_NAME_RE = re.compile(r'^[a-zA-Z0-9_\-\u4e00-\u9fff]+$')
+
+BASE = pathlib.Path(__file__).parent
+OPENCLAW_HOME = get_openclaw_home()
+DIST = BASE / 'dist'          # React 构建产物 (npm run build)
+DATA = BASE.parent / "data"
+SCRIPTS = BASE.parent / 'scripts'
+_REGISTRY_PATH = BASE.parent / 'registry.json'
+_ACTIVE_TASK_DATA_DIR = None
+
+# 静态资源 MIME 类型
+_MIME_TYPES = {
+    '.html': 'text/html; charset=utf-8',
+    '.js':   'application/javascript; charset=utf-8',
+    '.css':  'text/css; charset=utf-8',
+    '.json': 'application/json; charset=utf-8',
+    '.png':  'image/png',
+    '.jpg':  'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.gif':  'image/gif',
+    '.svg':  'image/svg+xml',
+    '.ico':  'image/x-icon',
+    '.woff': 'font/woff',
+    '.woff2': 'font/woff2',
+    '.ttf':  'font/ttf',
+    '.map':  'application/json',
+}
+
+
+def cors_headers(h):
+    req_origin = h.headers.get('Origin', '')
+    if ALLOWED_ORIGIN:
+        origin = ALLOWED_ORIGIN
+    elif req_origin in _DEFAULT_ORIGINS:
+        origin = req_origin
+    else:
+        origin = f'http://127.0.0.1:{_DASHBOARD_PORT}'
+    h.send_header('Access-Control-Allow-Origin', origin)
+    h.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+    h.send_header('Access-Control-Allow-Headers', 'Content-Type')
+
+
+def _iter_task_data_dirs():
+    """返回可用的任务数据目录候选（优先 workspace，其次本地 data）。"""
+    dirs = [DATA]
+    for p in sorted(OCLAW_HOME.glob('workspace-*/data')):
+        if p.is_dir():
+            dirs.append(p)
+    return dirs
+
+
+def _task_source_score(task_file: pathlib.Path):
+    """给任务源打分：优先非 demo 任务，其次任务数，再按文件更新时间。"""
+    try:
+        tasks = atomic_json_read(task_file, [])
+    except Exception:
+        tasks = []
+    if not isinstance(tasks, list):
+        tasks = []
+    non_demo = sum(1 for t in tasks if str((t or {}).get('id', '')) and not str((t or {}).get('id', '')).startswith('JJC-DEMO'))
+    try:
+        mtime = task_file.stat().st_mtime
+    except Exception:
+        mtime = 0
+    return (1 if non_demo > 0 else 0, non_demo, len(tasks), mtime)
+
+
+def get_task_data_dir():
+    """自动选择当前任务数据目录，并缓存结果以保持一次服务期内稳定。"""
+    global _ACTIVE_TASK_DATA_DIR
+    if _ACTIVE_TASK_DATA_DIR and _ACTIVE_TASK_DATA_DIR.is_dir():
+        return _ACTIVE_TASK_DATA_DIR
+    best_dir = DATA
+    best_score = (-1, -1, -1, -1)
+    for d in _iter_task_data_dirs():
+        tf = d / 'tasks_source.json'
+        if not tf.exists():
+            continue
+        score = _task_source_score(tf)
+        if score > best_score:
+            best_score = score
+            best_dir = d
+    _ACTIVE_TASK_DATA_DIR = best_dir
+    log.info(f'任务数据源: {_ACTIVE_TASK_DATA_DIR}')
+    return _ACTIVE_TASK_DATA_DIR
+
+
+def load_tasks():
+    task_data_dir = get_task_data_dir()
+    return atomic_json_read(task_data_dir / 'tasks_source.json', [])
+
+
+def save_tasks(tasks):
+    task_data_dir = get_task_data_dir()
+    atomic_json_write(task_data_dir / 'tasks_source.json', tasks)
+    _trigger_refresh()
+
+
+def _trigger_refresh():
+    """Trigger live data refresh in background."""
+    task_data_dir = get_task_data_dir()
+    script = task_data_dir.parent / 'scripts' / 'refresh_live_data.py'
+    if not script.exists():
+        script = SCRIPTS / 'refresh_live_data.py'
+
+    def _refresh():
+        try:
+            subprocess.run([python_bin(), str(script)], timeout=30)
+        except Exception as e:
+            log.warning(f'refresh_live_data.py 触发失败: {e}')
+    threading.Thread(target=_refresh, daemon=True).start()
+
+
+def modify_tasks(modifier):
+    """Atomically read-modify-write the tasks file.
+
+    ``modifier(tasks)`` receives the current task list, mutates it in place
+    (or returns a new list), and the result is persisted while the file lock
+    is held.  This avoids the TOCTOU race inherent in separate
+    ``load_tasks()`` / ``save_tasks()`` calls when background threads
+    (dispatch callbacks, periodic scanner) and the HTTP handler mutate tasks
+    concurrently.
+    """
+    task_data_dir = get_task_data_dir()
+    path = task_data_dir / 'tasks_source.json'
+    atomic_json_update(path, modifier, default=[])
+    _trigger_refresh()
+
+
+def modify_task(task_id, updater):
+    """Atomically update a single task identified by *task_id*.
+
+    ``updater(task)`` receives the task dict and should mutate it in place.
+    Returns ``True`` if the task was found and updated, ``False`` otherwise.
+    """
+    found = [False]
+
+    def _modifier(tasks):
+        task = next((t for t in tasks if t.get('id') == task_id), None)
+        if task is None:
+            return tasks
+        updater(task)
+        task['updatedAt'] = now_iso()
+        found[0] = True
+        return tasks
+
+    modify_tasks(_modifier)
+    return found[0]
+
+
+def handle_task_action(task_id, action, reason):
+    """Stop/cancel/resume a task from the dashboard.
+    
+    使用 modify_tasks 原子更新，避免与 sync 脚本的 TOCTOU 竞态。
+    """
+    result = {'ok': False, 'error': f'任务 {task_id} 不存在'}
+    dispatch_needed = False
+    dispatch_state = None
+
+    def _do_action(tasks):
+        nonlocal result, dispatch_needed, dispatch_state
+        task = next((t for t in tasks if t.get('id') == task_id), None)
+        if not task:
+            return tasks
+
+        old_state = task.get('state', '')
+        _ensure_scheduler(task)
+        _scheduler_snapshot(task, f'task-action-before-{action}')
+
+        if action == 'stop':
+            task['state'] = 'Blocked'
+            task['block'] = reason or '老板叫停'
+            task['now'] = f'⏸️ 已暂停：{reason}'
+            task.setdefault('_scheduler', {})['enabled'] = False
+        elif action == 'cancel':
+            task['state'] = 'Cancelled'
+            task['block'] = reason or '老板取消'
+            task['now'] = f'🚫 已取消：{reason}'
+            task.setdefault('_scheduler', {})['enabled'] = False
+        elif action == 'resume':
+            task['state'] = task.get('_prev_state', 'Doing')
+            task['block'] = '无'
+            task['now'] = f'▶️ 已恢复执行'
+            task.setdefault('_scheduler', {})['enabled'] = True
+
+        if action in ('stop', 'cancel'):
+            task['_prev_state'] = old_state
+
+        task.setdefault('flow_log', []).append({
+            'at': now_iso(),
+            'from': '老板',
+            'to': task.get('org', ''),
+            'remark': f'{"⏸️ 叫停" if action == "stop" else "🚫 取消" if action == "cancel" else "▶️ 恢复"}：{reason}'
+        })
+
+        if action == 'resume':
+            _scheduler_mark_progress(task, f'恢复到 {task.get("state", "Doing")}')
+        else:
+            _scheduler_add_flow(task, f'老板{action}：{reason or "无"}')
+
+        task['updatedAt'] = now_iso()
+
+        if action == 'resume' and task.get('state') not in _TERMINAL_STATES:
+            dispatch_needed = True
+            dispatch_state = task.get('state')
+
+        label = {'stop': '已叫停', 'cancel': '已取消', 'resume': '已恢复'}[action]
+        result = {'ok': True, 'message': f'{task_id} {label}'}
+        return tasks
+
+    modify_tasks(_do_action)
+
+    if dispatch_needed:
+        tasks = load_tasks()
+        task = next((t for t in tasks if t.get('id') == task_id), None)
+        if task:
+            dispatch_for_state(task_id, task, dispatch_state, trigger='resume')
+
+    return result
+
+
+def handle_archive_task(task_id, archived, archive_all_done=False):
+    """Archive or unarchive a task, or batch-archive all Done/Cancelled tasks.
+    
+    归档非终态任务时，自动将其标记为 Cancelled，避免出现
+    「已归档但状态仍是 Doing/Taizi」的混乱状态。
+    
+    使用 modify_tasks 原子更新。
+    
+    关键行为：已终态（Done/Cancelled）的任务归档后直接从 tasks_source.json 中
+    删除，避免累积「已取消」任务永远挂在官员卡片下。
+    """
+    result = {'ok': False, 'error': f'任务 {task_id} 不存在'}
+
+    def _do_archive(tasks):
+        nonlocal result
+        if archive_all_done:
+            # 批量归档：删除所有已终态且已归档的任务
+            before = len(tasks)
+            tasks = [t for t in tasks if t.get('state') not in ('Done', 'Cancelled') or not t.get('archived')]
+            count = before - len(tasks)
+            result = {'ok': True, 'message': f'{count} 个任务已归档清理', 'count': count}
+            return tasks
+        task = next((t for t in tasks if t.get('id') == task_id), None)
+        if not task:
+            return tasks
+        if archived:
+            # 归档：终态任务直接删除，非终态任务标记 Cancelled 后删除
+            if task.get('state') in ('Done', 'Cancelled'):
+                tasks = [t for t in tasks if t.get('id') != task_id]
+                result = {'ok': True, 'message': f'{task_id} 已归档清理'}
+            else:
+                task['archived'] = True
+                task['archivedAt'] = now_iso()
+                old_state = task.get('state', '?')
+                task['state'] = 'Cancelled'
+                task['now'] = f'归档时自动取消（原状态: {old_state}）'
+                _scheduler_add_flow(task, f'归档 → 自动取消（原状态: {old_state}）')
+                task['updatedAt'] = now_iso()
+                result = {'ok': True, 'message': f'{task_id} 已归档（原状态: {old_state}）'}
+        else:
+            # 取消归档：只对仍在列表中的任务有效
+            task.pop('archivedAt', None)
+            task['archived'] = False
+            task['updatedAt'] = now_iso()
+            result = {'ok': True, 'message': f'{task_id} 已取消归档'}
+        return tasks
+
+    modify_tasks(_do_archive)
+    return result
+
+
+def update_task_todos(task_id, todos):
+    """Update the todos list for a task."""
+    tasks = load_tasks()
+    task = next((t for t in tasks if t.get('id') == task_id), None)
+    if not task:
+        return {'ok': False, 'error': f'任务 {task_id} 不存在'}
+
+    task['todos'] = todos
+    task['updatedAt'] = now_iso()
+    save_tasks(tasks)
+    return {'ok': True, 'message': f'{task_id} todos 已更新'}
+
+
+def read_skill_content(agent_id, skill_name):
+    """Read SKILL.md content for a specific skill."""
+    # 输入校验：防止路径遍历
+    if not _SAFE_NAME_RE.match(agent_id) or not _SAFE_NAME_RE.match(skill_name):
+        return {'ok': False, 'error': '参数含非法字符'}
+    cfg = read_json(DATA / 'agent_config.json', {})
+    agents = cfg.get('agents', [])
+    ag = next((a for a in agents if a.get('id') == agent_id), None)
+    if not ag:
+        return {'ok': False, 'error': f'Agent {agent_id} 不存在'}
+    sk = next((s for s in ag.get('skills', []) if s.get('name') == skill_name), None)
+    if not sk:
+        return {'ok': False, 'error': f'技能 {skill_name} 不存在'}
+    skill_path = pathlib.Path(sk.get('path', '')).resolve()
+    # 路径遍历保护：确保路径在 OCLAW_HOME 或项目目录下
+    allowed_roots = (OCLAW_HOME.resolve(), BASE.parent.resolve())
+    if not any(str(skill_path).startswith(str(root)) for root in allowed_roots):
+        return {'ok': False, 'error': '路径不在允许的目录范围内'}
+    if not skill_path.exists():
+        return {'ok': True, 'name': skill_name, 'agent': agent_id, 'content': '(SKILL.md 文件不存在)', 'path': str(skill_path)}
+    try:
+        content = skill_path.read_text()
+        return {'ok': True, 'name': skill_name, 'agent': agent_id, 'content': content, 'path': str(skill_path)}
+    except Exception as e:
+        return {'ok': False, 'error': str(e)}
+
+
+def toggle_global_skill(agent_id, skill_name, enabled):
+    """启用/禁用 Agent 的某个全局技能。"""
+    if not _SAFE_NAME_RE.match(agent_id) or not _SAFE_NAME_RE.match(skill_name):
+        return {'ok': False, 'error': '参数含非法字符'}
+    cfg_path = DATA / 'agent_config.json'
+    cfg = read_json(cfg_path, {})
+    for ag in cfg.get('agents', []):
+        if ag.get('id') == agent_id:
+            for s in ag.get('skills', []):
+                if s.get('name') == skill_name and s.get('isGlobal'):
+                    s['enabled'] = enabled
+                    atomic_json_write(cfg_path, cfg)
+                    # 同步到 openclaw workspace
+                    subprocess.run([python_bin(), str(SCRIPTS / 'sync_agent_config.py')], timeout=10)
+                    return {'ok': True, 'message': f'{"启用" if enabled else "禁用"} 全局技能 {skill_name}'}
+    return {'ok': False, 'error': f'全局技能 {skill_name} 不存在于 {agent_id}'}
+
+
+def add_skill_to_agent(agent_id, skill_name, description, trigger=''):
+    """Create a new skill for an agent with a standardised SKILL.md template."""
+    if not _SAFE_NAME_RE.match(skill_name):
+        return {'ok': False, 'error': f'skill_name 含非法字符: {skill_name}'}
+    if not _SAFE_NAME_RE.match(agent_id):
+        return {'ok': False, 'error': f'agentId 含非法字符: {agent_id}'}
+    workspace = OCLAW_HOME / f'workspace-{agent_id}' / 'skills' / skill_name
+    workspace.mkdir(parents=True, exist_ok=True)
+    skill_md = workspace / 'SKILL.md'
+    desc_line = description or skill_name
+    trigger_section = f'\n## 触发条件\n{trigger}\n' if trigger else ''
+    template = (f'---\n'
+                f'name: {skill_name}\n'
+                f'description: {desc_line}\n'
+                f'---\n\n'
+                f'# {skill_name}\n\n'
+                f'{desc_line}\n'
+                f'{trigger_section}\n'
+                f'## 输入\n\n'
+                f'<!-- 说明此技能接收什么输入 -->\n\n'
+                f'## 处理流程\n\n'
+                f'1. 步骤一\n'
+                f'2. 步骤二\n\n'
+                f'## 输出规范\n\n'
+                f'<!-- 说明产出物格式与交付要求 -->\n\n'
+                f'## 注意事项\n\n'
+                f'- (在此补充约束、限制或特殊规则)\n')
+    skill_md.write_text(template)
+    # Re-sync agent config
+    try:
+        subprocess.run([python_bin(), str(SCRIPTS / 'sync_agent_config.py')], timeout=10)
+    except Exception:
+        pass
+    return {'ok': True, 'message': f'技能 {skill_name} 已添加到 {agent_id}', 'path': str(skill_md)}
+
+
+def add_remote_skill(agent_id, skill_name, source_url, description=''):
+    """从远程 URL 或本地路径为 Agent 添加 skill SKILL.md 文件。
+    
+    支持的源：
+    - HTTPS URLs: https://raw.githubusercontent.com/...
+    - 本地路径: /path/to/SKILL.md 或 file:///path/to/SKILL.md
+    """
+    # 输入校验
+    if not _SAFE_NAME_RE.match(agent_id):
+        return {'ok': False, 'error': f'agentId 含非法字符: {agent_id}'}
+    if not _SAFE_NAME_RE.match(skill_name):
+        return {'ok': False, 'error': f'skillName 含非法字符: {skill_name}'}
+    if not source_url or not isinstance(source_url, str):
+        return {'ok': False, 'error': 'sourceUrl 必须是有效的字符串'}
+    
+    source_url = source_url.strip()
+    
+    # 检查 Agent 是否存在
+    cfg = read_json(DATA / 'agent_config.json', {})
+    agents = cfg.get('agents', [])
+    if not any(a.get('id') == agent_id for a in agents):
+        return {'ok': False, 'error': f'Agent {agent_id} 不存在'}
+    
+    # 下载或读取文件内容
+    try:
+        if source_url.startswith('http://') or source_url.startswith('https://'):
+            # HTTPS URL 校验
+            if not validate_url(source_url, allowed_schemes=('https',)):
+                return {'ok': False, 'error': 'URL 无效或不安全（仅支持 HTTPS）'}
+            
+            # 从 URL 下载，带超时保护
+            req = Request(source_url, headers={'User-Agent': 'OpenClaw-SkillManager/1.0'})
+            try:
+                resp = urlopen(req, timeout=10)
+                content = resp.read(10 * 1024 * 1024).decode('utf-8')  # 最多 10MB
+                if len(content) > 10 * 1024 * 1024:
+                    return {'ok': False, 'error': '文件过大（最大 10MB）'}
+            except Exception as e:
+                return {'ok': False, 'error': f'URL 无法访问: {str(e)[:100]}'}
+        
+        elif source_url.startswith('file://'):
+            # file:// URL 格式
+            local_path = pathlib.Path(source_url[7:]).resolve()
+            if not local_path.exists():
+                return {'ok': False, 'error': f'本地文件不存在: {local_path}'}
+            # 路径遍历防护：与本地路径分支一致，确保在允许范围内
+            allowed_roots = (OCLAW_HOME.resolve(), BASE.parent.resolve())
+            if not any(str(local_path).startswith(str(root)) for root in allowed_roots):
+                return {'ok': False, 'error': '路径不在允许的目录范围内'}
+            content = local_path.read_text()
+        
+        elif source_url.startswith('/') or source_url.startswith('.'):
+            # 本地绝对或相对路径
+            local_path = pathlib.Path(source_url).resolve()
+            if not local_path.exists():
+                return {'ok': False, 'error': f'本地文件不存在: {local_path}'}
+            # 路径遍历防护
+            allowed_roots = (OCLAW_HOME.resolve(), BASE.parent.resolve())
+            if not any(str(local_path).startswith(str(root)) for root in allowed_roots):
+                return {'ok': False, 'error': '路径不在允许的目录范围内'}
+            content = local_path.read_text()
+        
+        else:
+            return {'ok': False, 'error': '不支持的 URL 格式（仅支持 https://, file://, 或本地路径）'}
+    except Exception as e:
+        return {'ok': False, 'error': f'文件读取失败: {str(e)[:100]}'}
+    
+    # 基础验证：检查是否为 Markdown 且包含 YAML frontmatter
+    if not content.startswith('---'):
+        return {'ok': False, 'error': '文件格式无效（缺少 YAML frontmatter）'}
+    
+    # 验证 frontmatter 结构（先做字符串检查，再尝试 YAML 解析）
+    parts = content.split('---', 2)
+    if len(parts) < 3:
+        return {'ok': False, 'error': '文件格式无效（YAML frontmatter 结构错误）'}
+    if 'name:' not in content[:500]:
+        return {'ok': False, 'error': '文件格式无效：frontmatter 缺少 name 字段'}
+    try:
+        import yaml
+        yaml.safe_load(parts[1])  # 严格校验 YAML 语法
+    except ImportError:
+        pass  # PyYAML 未安装，跳过严格验证，字符串检查已通过
+    except Exception as e:
+        return {'ok': False, 'error': f'YAML 格式无效: {str(e)[:100]}'}
+    
+    # 创建本地目录
+    workspace = OCLAW_HOME / f'workspace-{agent_id}' / 'skills' / skill_name
+    workspace.mkdir(parents=True, exist_ok=True)
+    skill_md = workspace / 'SKILL.md'
+    
+    # 写入 SKILL.md
+    skill_md.write_text(content)
+    
+    # 保存源信息到 .source.json
+    source_info = {
+        'skillName': skill_name,
+        'sourceUrl': source_url,
+        'description': description,
+        'addedAt': now_iso(),
+        'lastUpdated': now_iso(),
+        'checksum': _compute_checksum(content),
+        'status': 'valid',
+    }
+    source_json = workspace / '.source.json'
+    source_json.write_text(json.dumps(source_info, ensure_ascii=False, indent=2))
+    
+    # Re-sync agent config
+    try:
+        subprocess.run([python_bin(), str(SCRIPTS / 'sync_agent_config.py')], timeout=10)
+    except Exception:
+        pass
+    
+    return {
+        'ok': True,
+        'message': f'技能 {skill_name} 已从远程源添加到 {agent_id}',
+        'skillName': skill_name,
+        'agentId': agent_id,
+        'source': source_url,
+        'localPath': str(skill_md),
+        'size': len(content),
+        'addedAt': now_iso(),
+    }
+
+
+def get_provider_keys():
+    """列出所有 Provider 及其 API Key（脱敏），模型从 defaults.models 读取。
+    
+    defaults.models 是 OpenClaw 实际使用的模型列表，是唯一真相源。
+    providers.models 作为补充参考。
+    """
+    cfg = read_json(OPENCLAW_HOME / 'openclaw.json', {})
+    providers = cfg.get('models', {}).get('providers', {})
+    
+    # 从 defaults.models 收集每个 provider 的模型
+    defaults_models = cfg.get('agents', {}).get('defaults', {}).get('models', {})
+    provider_models = {}  # provider_name → [model_ids]
+    if isinstance(defaults_models, dict):
+        for full_id in defaults_models.keys():
+            if not full_id:
+                continue
+            parts = full_id.split('/', 1)
+            if len(parts) != 2:
+                continue
+            pname, model_id = parts
+            # 大小写不敏感匹配 provider
+            matched = None
+            for pn in providers:
+                if pn.lower() == pname.lower():
+                    matched = pn
+                    break
+            if matched:
+                if matched not in provider_models:
+                    provider_models[matched] = []
+                provider_models[matched].append(model_id)
+    
+    result = []
+    for name, pcfg in providers.items():
+        key = pcfg.get('apiKey', '')
+        masked = ''
+        if key:
+            masked = key[:8] + '…' + key[-4:] if len(key) > 12 else '***'
+        # 合并：defaults.models 中的模型 + providers.models 中的模型
+        active_models = provider_models.get(name, [])
+        configured_models = [m.get('id', '') if isinstance(m, dict) else m for m in pcfg.get('models', [])]
+        result.append({
+            'name': name,
+            'baseUrl': pcfg.get('baseUrl', ''),
+            'api': pcfg.get('api', ''),
+            'apiKeyMasked': masked,
+            'hasKey': bool(key),
+            'activeModels': active_models,       # defaults.models 中实际启用的
+            'configuredModels': configured_models,  # providers.models 中配置的
+        })
+    return {'ok': True, 'providers': result}
+
+
+def get_remote_skills_list():
+    """列表所有已添加的远程 skills 及其源信息"""
+    remote_skills = []
+    
+    # 遍历所有 workspace
+    for ws_dir in OCLAW_HOME.glob('workspace-*'):
+        agent_id = ws_dir.name.replace('workspace-', '')
+        skills_dir = ws_dir / 'skills'
+        if not skills_dir.exists():
+            continue
+        
+        for skill_dir in skills_dir.iterdir():
+            if not skill_dir.is_dir():
+                continue
+            skill_name = skill_dir.name
+            source_json = skill_dir / '.source.json'
+            skill_md = skill_dir / 'SKILL.md'
+            
+            if not source_json.exists():
+                # 本地创建的 skill，跳过
+                continue
+            
+            try:
+                source_info = json.loads(source_json.read_text())
+                # 检查 SKILL.md 是否存在
+                status = 'valid' if skill_md.exists() else 'not-found'
+                remote_skills.append({
+                    'skillName': skill_name,
+                    'agentId': agent_id,
+                    'sourceUrl': source_info.get('sourceUrl', ''),
+                    'description': source_info.get('description', ''),
+                    'localPath': str(skill_md),
+                    'addedAt': source_info.get('addedAt', ''),
+                    'lastUpdated': source_info.get('lastUpdated', ''),
+                    'status': status,
+                })
+            except Exception:
+                pass
+    
+    return {
+        'ok': True,
+        'remoteSkills': remote_skills,
+        'count': len(remote_skills),
+        'listedAt': now_iso(),
+    }
+
+
+def update_remote_skill(agent_id, skill_name):
+    """更新已添加的远程 skill 为最新版本（重新从源 URL 下载）"""
+    if not _SAFE_NAME_RE.match(agent_id):
+        return {'ok': False, 'error': f'agentId 含非法字符: {agent_id}'}
+    if not _SAFE_NAME_RE.match(skill_name):
+        return {'ok': False, 'error': f'skillName 含非法字符: {skill_name}'}
+    
+    workspace = OCLAW_HOME / f'workspace-{agent_id}' / 'skills' / skill_name
+    source_json = workspace / '.source.json'
+    skill_md = workspace / 'SKILL.md'
+    
+    if not source_json.exists():
+        return {'ok': False, 'error': f'技能 {skill_name} 不是远程 skill（无 .source.json）'}
+    
+    try:
+        source_info = json.loads(source_json.read_text())
+        source_url = source_info.get('sourceUrl', '')
+        if not source_url:
+            return {'ok': False, 'error': '源 URL 不存在'}
+        
+        # 重新下载
+        result = add_remote_skill(agent_id, skill_name, source_url, 
+                                  source_info.get('description', ''))
+        if result['ok']:
+            result['message'] = f'技能已更新'
+            source_info_updated = json.loads(source_json.read_text())
+            result['newVersion'] = source_info_updated.get('checksum', 'unknown')
+        return result
+    except Exception as e:
+        return {'ok': False, 'error': f'更新失败: {str(e)[:100]}'}
+
+
+def remove_remote_skill(agent_id, skill_name):
+    """移除已添加的远程 skill"""
+    if not _SAFE_NAME_RE.match(agent_id):
+        return {'ok': False, 'error': f'agentId 含非法字符: {agent_id}'}
+    if not _SAFE_NAME_RE.match(skill_name):
+        return {'ok': False, 'error': f'skillName 含非法字符: {skill_name}'}
+    
+    workspace = OCLAW_HOME / f'workspace-{agent_id}' / 'skills' / skill_name
+    if not workspace.exists():
+        return {'ok': False, 'error': f'技能不存在: {skill_name}'}
+    
+    # 检查是否为远程 skill
+    source_json = workspace / '.source.json'
+    if not source_json.exists():
+        return {'ok': False, 'error': f'技能 {skill_name} 不是远程 skill，无法通过此 API 移除'}
+    
+    try:
+        # 删除整个 skill 目录
+        import shutil
+        shutil.rmtree(workspace)
+        
+        # Re-sync agent config
+        try:
+            subprocess.run([python_bin(), str(SCRIPTS / 'sync_agent_config.py')], timeout=10)
+        except Exception:
+            pass
+        
+        return {'ok': True, 'message': f'技能 {skill_name} 已从 {agent_id} 移除'}
+    except Exception as e:
+        return {'ok': False, 'error': f'移除失败: {str(e)[:100]}'}
+
+
+def _compute_checksum(content: str) -> str:
+    import hashlib
+    return hashlib.sha256(content.encode()).hexdigest()[:16]
+
+
+def migrate_notification_config():
+    """自动迁移旧配置 (feishu_webhook) 到新结构 (notification)"""
+    cfg_path = DATA / 'morning_brief_config.json'
+    cfg = read_json(cfg_path, {})
+    if not cfg:
+        return
+    if 'notification' in cfg:
+        return
+    if 'feishu_webhook' not in cfg:
+        return
+    webhook = cfg.get('feishu_webhook', '').strip()
+    cfg['notification'] = {
+        'enabled': bool(webhook),
+        'channel': 'feishu',
+        'webhook': webhook
+    }
+    try:
+        atomic_json_write(cfg_path, cfg)
+        log.info('已自动迁移 feishu_webhook 到 notification 配置')
+    except Exception as e:
+        log.warning(f'迁移配置失败: {e}')
+
+
+def push_notification():
+    """通用消息推送 (支持多渠道)"""
+    cfg = read_json(DATA / 'morning_brief_config.json', {})
+    notification = cfg.get('notification', {})
+    if not notification and cfg.get('feishu_webhook'):
+        notification = {'enabled': True, 'channel': 'feishu', 'webhook': cfg['feishu_webhook']}
+    if not notification.get('enabled', True):
+        return
+    channel_type = notification.get('channel', 'feishu')
+    webhook = notification.get('webhook', '').strip()
+    if not webhook:
+        return
+    channel_cls = get_channel(channel_type)
+    if not channel_cls:
+        log.warning(f'未知的通知渠道: {channel_type}')
+        return
+    if not channel_cls.validate_webhook(webhook):
+        log.warning(f'{channel_cls.label} Webhook URL 不合法: {webhook}')
+        return
+    brief = read_json(DATA / 'morning_brief.json', {})
+    date_str = brief.get('date', '')
+    total = sum(len(v) for v in (brief.get('categories') or {}).values())
+    if not total:
+        return
+    cat_lines = []
+    for cat, items in (brief.get('categories') or {}).items():
+        if items:
+            cat_lines.append(f'  {cat}: {len(items)} 条')
+    summary = '\n'.join(cat_lines)
+    date_fmt = date_str[:4] + '年' + date_str[4:6] + '月' + date_str[6:] + '日' if len(date_str) == 8 else date_str
+    title = f'📰 天下要闻 · {date_fmt}'
+    content = f'共 **{total}** 条要闻已更新\n{summary}'
+    url = f'http://127.0.0.1:{_DASHBOARD_PORT}'
+    success = channel_cls.send(webhook, title, content, url)
+    print(f'[{channel_cls.label}] 推送{"成功" if success else "失败"}')
+
+
+def push_to_feishu():
+    """Push morning brief link to Feishu via webhook. (已弃用，使用 push_notification)"""
+    push_notification()
+
+
+# 任务标题最低要求
+_MIN_TITLE_LEN = 6
+_JUNK_TITLES = {
+    '?', '？', '好', '好的', '是', '否', '不', '不是', '对', '了解', '收到',
+    '嗯', '哦', '知道了', '开启了么', '可以', '不行', '行', 'ok', 'yes', 'no',
+    '你去开启', '测试', '试试', '看看',
+}
+
+
+def handle_create_task(title, org='规划部', official='规划师', priority='normal', template_id='', params=None, target_dept=''):
+    """从看板创建新任务（圣旨模板下旨）。"""
+    if not title or not title.strip():
+        return {'ok': False, 'error': '任务标题不能为空'}
+    title = title.strip()
+    # 剥离 Conversation info 元数据
+    title = re.split(r'\n*Conversation info\s*\(', title, maxsplit=1)[0].strip()
+    title = re.split(r'\n*```', title, maxsplit=1)[0].strip()
+    # 清理常见前缀: "传旨:" "下旨:" 等
+    title = re.sub(r'^(传旨|下旨)[：:\uff1a]\s*', '', title)
+    if len(title) > 100:
+        title = title[:100] + '…'
+    # 标题质量校验：防止闲聊被误建为任务
+    if len(title) < _MIN_TITLE_LEN:
+        return {'ok': False, 'error': f'标题过短（{len(title)}<{_MIN_TITLE_LEN}字），不像是任务'}
+    if title.lower() in _JUNK_TITLES:
+        return {'ok': False, 'error': f'「{title}」不是有效任务描述，请输入具体工作指令'}
+    # 生成 task id: JJC-YYYYMMDD-NNN
+    today = datetime.datetime.now().strftime('%Y%m%d')
+    tasks = load_tasks()
+    today_ids = [t['id'] for t in tasks if t.get('id', '').startswith(f'JJC-{today}-')]
+    seq = 1
+    if today_ids:
+        nums = [int(tid.split('-')[-1]) for tid in today_ids if tid.split('-')[-1].isdigit()]
+        seq = max(nums) + 1 if nums else 1
+    task_id = f'JJC-{today}-{seq:03d}'
+    # 正确流程起点：老板 -> 总办分拣
+    # target_dept 记录模板建议的最终执行部门（仅供执行办派发参考）
+    initial_org = '总办'
+    new_task = {
+        'id': task_id,
+        'title': title,
+        'official': official,
+        'org': initial_org,
+        'state': 'Taizi',
+        'now': '等待总办分拣',
+        'eta': '-',
+        'block': '无',
+        'output': '',
+        'ac': '',
+        'priority': priority,
+        'templateId': template_id,
+        'templateParams': params or {},
+        # ── 六合一字段（SDD/CDD/任务分解/SE，兼容旧任务 .get() 降级）──
+        'spec': None,                    # SDD 契约 {purpose,outputs,acceptance_criteria,boundaries,fri_ids,dependencies,contract_interfaces}
+        'spec_status': 'pending',        # pending|draft|reviewed|blocked
+        'cdd_injected': None,            # CDD 注入留痕 {layer,knowledge_src,spec_hash,timestamp,agent}
+        'skill_ref': None,               # SE 环④：任务引用过的 skill
+        'experience_card': None,         # SE 环①：Done 后经验卡
+        'decomp_audit': {},              # 任务分解自查 {score_pct,dims,verdict,audit_seq, iterate}
+        'cdd': None,                     # CDD 协作契约 {agents,interfaces,alignment_rules}（军师/规划部提交）
+        'flow_log': [{
+            'at': now_iso(),
+            'from': '老板',
+            'to': initial_org,
+            'remark': f'下达任务：{title}'
+        }],
+        'updatedAt': now_iso(),
+    }
+    if target_dept:
+        new_task['targetDept'] = target_dept
+
+    _ensure_scheduler(new_task)
+    _scheduler_snapshot(new_task, 'create-task-initial')
+    _scheduler_mark_progress(new_task, '任务创建')
+
+    tasks.insert(0, new_task)
+    save_tasks(tasks)
+    log.info(f'创建任务: {task_id} | {title[:40]}')
+
+    dispatch_for_state(task_id, new_task, 'Taizi', trigger='imperial-edict')
+
+    return {'ok': True, 'taskId': task_id, 'message': f'任务 {task_id} 已创建，正在派发给总办'}
+
+
+def _todo_progress(task):
+    todos = task.get('todos') or []
+    total = len(todos)
+    completed = sum(1 for td in todos if td.get('status') == 'completed')
+    return completed, total
+
+
+def handle_review_action(task_id, action, comment=''):
+    """审议部门：通过/驳回。使用 modify_tasks 原子更新。"""
+    result = {'ok': False, 'error': f'任务 {task_id} 不存在'}
+
+    def _do_review(tasks):
+        nonlocal result
+        task = next((t for t in tasks if t.get('id') == task_id), None)
+        if not task:
+            return tasks
+        if task.get('state') not in ('Review', 'Menxia'):
+            result = {'ok': False, 'error': f'任务 {task_id} 当前状态为 {task.get("state")}，无法审议'}
+            return tasks
+
+        _ensure_scheduler(task)
+        _scheduler_snapshot(task, f'review-before-{action}')
+
+        if action == 'approve':
+            if task['state'] == 'Menxia':
+                task['state'] = 'Assigned'
+                task['now'] = '审议部通过，移交执行办派发'
+                remark = f'✅ 通过：{comment or "审议部审议通过"}'
+                to_dept = '执行办'
+            else:  # Review
+                completed, total = _todo_progress(task)
+                if total > 0 and completed < total:
+                    result = {'ok': False, 'error': f'子任务尚未全部完成（{completed}/{total}），不能直接通过完结'}
+                    return tasks
+                task['state'] = 'Done'
+                task['now'] = '审批通过，任务完成'
+                remark = f'✅ 审批通过：{comment or "审查通过"}'
+                to_dept = '老板'
+        elif action == 'reject':
+            round_num = (task.get('review_round') or 0) + 1
+            task['review_round'] = round_num
+            task['state'] = 'Zhongshu'
+            task['now'] = f'驳回退回规划部修订（第{round_num}轮）'
+            remark = f'🚫 驳回：{comment or "需要修改"}'
+            to_dept = '规划部'
+        else:
+            result = {'ok': False, 'error': f'未知操作: {action}'}
+            return tasks
+
+        task.setdefault('flow_log', []).append({
+            'at': now_iso(),
+            'from': '审议部' if task.get('state') != 'Done' else '老板',
+            'to': to_dept,
+            'remark': remark
+        })
+        _scheduler_mark_progress(task, f'审议动作 {action} -> {task.get("state")}')
+        task['updatedAt'] = now_iso()
+        result = {'ok': True, 'message': f'{task_id} 审议完成'}
+        return tasks
+
+    modify_tasks(_do_review)
+
+    # 🚀 审批后自动派发对应 Agent（在锁外执行，避免阻塞）
+    if result.get('ok'):
+        tasks = load_tasks()
+        task = next((t for t in tasks if t.get('id') == task_id), None)
+        if task and task.get('state') not in ('Done',):
+            dispatch_for_state(task_id, task, task.get('state'))
+
+    return result
+
+    # 🚀 审批后自动派发对应 Agent
+    new_state = task['state']
+    if new_state not in ('Done',):
+        dispatch_for_state(task_id, task, new_state)
+
+    label = '已通过' if action == 'approve' else '已驳回'
+    dispatched = ' (已自动派发 Agent)' if new_state != 'Done' else ''
+    return {'ok': True, 'message': f'{task_id} {label}{dispatched}'}
+
+
+# ══ Agent 在线状态检测 ══
+
+# ── 唯一真源：古 ID → 现代名 ───────────────────────────────
+# 改名铁律：英文 ID / 状态机 key / API / Agent ID 一律不变，只改显示 label 与文案。
+# 要调整某个部门的名字，只改这里一处，全链路（后端/前端/数据/同步）统一生效。
+ORG_MODERN = {
+    'taizi':   '总办',
+    'zhongshu':'规划部',
+    'menxia':  '审议部',
+    'shangshu':'执行办',
+    'libu_hr': '人力路由处',
+    'libu':    '内容部',
+    'bingbu':  '开发部',
+    'gongbu':  '设计部',
+    'xingbu':  '质控部',
+    'hubu':    '交付汇总处',
+    'zaochao': '运维组',
+    'boss':    '老板',
+    'liubu':   '执行部门',
+}
+
+# 历史古名 → 现代名（用于数据迁移 + 前端/后端 fallback 兼容）
+ORG_LEGACY_MAP = {
+    '皇上': '老板',  '太子': '总办',  '中书省': '规划部',  '门下省': '审议部',
+    '尚书省': '执行办',  '吏部': '人力路由处',  '礼部': '内容部',  '兵部': '开发部',
+    '刑部': '质控部',  '工部': '设计部',  '户部': '交付汇总处',  '钦天监': '运维组',
+    '六部': '执行部门',  '储君': '项目总控',  '中书令': '规划师',  '侍中': '审议官',
+    '尚书令': '调度长',  '朝报官': '运维专员',
+    '礼部尚书': '内容负责人', '户部尚书': '交付负责人', '兵部尚书': '开发负责人',
+    '刑部尚书': '质控负责人', '工部尚书': '设计负责人', '吏部尚书': '人力路由负责人',
+}
+
+
+def _modern(org):
+    """把任意 org 值归一为现代化名。命中现代名直接返回；命中历史古名转现代名；
+    既不是已现代名也不是古名时原样返回（保持健壮，不抛异常）。"""
+    if not org:
+        return org
+    if org in ORG_MODERN.values():
+        return org
+    return ORG_LEGACY_MAP.get(org, org)
+
+
+_AGENT_DEPTS = [
+    {'id':'taizi',   'label':ORG_MODERN['taizi'],   'emoji':'🤴', 'role':'项目总控', 'rank':'总办'},
+    {'id':'zhongshu','label':ORG_MODERN['zhongshu'],'emoji':'📜', 'role':'军师',     'rank':'负责人'},
+    {'id':'menxia',  'label':ORG_MODERN['menxia'],  'emoji':'🔍', 'role':'审计官',   'rank':'负责人'},
+    {'id':'shangshu','label':ORG_MODERN['shangshu'],'emoji':'📮', 'role':'调度长', 'rank':'负责人'},
+    {'id':'hubu',    'label':ORG_MODERN['hubu'],    'emoji':'💰', 'role':'交付主管', 'rank':'负责人'},
+    {'id':'libu',    'label':ORG_MODERN['libu'],    'emoji':'📝', 'role':'内容主管', 'rank':'负责人'},
+    {'id':'bingbu',  'label':ORG_MODERN['bingbu'],  'emoji':'⚔️', 'role':'研发主管', 'rank':'负责人'},
+    {'id':'xingbu',  'label':ORG_MODERN['xingbu'],  'emoji':'⚖️', 'role':'品控官',   'rank':'负责人'},
+    {'id':'gongbu',  'label':ORG_MODERN['gongbu'],  'emoji':'🔧', 'role':'视觉主管', 'rank':'负责人'},
+    {'id':'libu_hr', 'label':ORG_MODERN['libu_hr'], 'emoji':'👔', 'role':'路由主管', 'rank':'负责人'},
+    {'id':'zaochao', 'label':ORG_MODERN['zaochao'], 'emoji':'📰', 'role':'运维主管', 'rank':'负责人'},
+]
+
+
+def _check_gateway_alive():
+    """检测 Gateway 是否在运行。
+
+    Windows 上不要依赖 pgrep；优先通过本地端口探测判断。
+    """
+    if _check_gateway_probe():
+        return True
+    try:
+        if os.name == 'nt':
+            with socket.create_connection(('127.0.0.1', 18789), timeout=2):
+                return True
+            return False
+        result = subprocess.run(['pgrep', '-f', 'openclaw-gateway'],
+                                 capture_output=True, text=True, timeout=5)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _check_gateway_probe():
+    """通过 HTTP probe 检测 Gateway 是否响应。"""
+    for url in ('http://127.0.0.1:18789/', 'http://127.0.0.1:18789/healthz'):
+        try:
+            from urllib.request import urlopen
+            resp = urlopen(url, timeout=3)
+            if 200 <= resp.status < 500:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _get_agent_session_status(agent_id):
+    """读取 Agent 的 sessions.json 获取活跃状态。
+    返回: (last_active_ts_ms, session_count, is_busy)
+    """
+    sessions_file = OCLAW_HOME / 'agents' / agent_id / 'sessions' / 'sessions.json'
+    if not sessions_file.exists():
+        return 0, 0, False
+    try:
+        data = json.loads(sessions_file.read_text())
+        if not isinstance(data, dict):
+            return 0, 0, False
+        session_count = len(data)
+        last_ts = 0
+        for v in data.values():
+            ts = v.get('updatedAt', 0)
+            if isinstance(ts, (int, float)) and ts > last_ts:
+                last_ts = ts
+        now_ms = int(datetime.datetime.now().timestamp() * 1000)
+        age_ms = now_ms - last_ts if last_ts else 9999999999
+        is_busy = age_ms <= 2 * 60 * 1000  # 2分钟内视为正在工作
+        return last_ts, session_count, is_busy
+    except Exception:
+        return 0, 0, False
+
+
+def _check_agent_process(agent_id):
+    """检测是否有该 Agent 的 openclaw-agent 进程正在运行。"""
+    try:
+        result = subprocess.run(
+            ['pgrep', '-f', f'openclaw.*--agent.*{agent_id}'],
+            capture_output=True, text=True, timeout=5
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _check_agent_workspace(agent_id):
+    """检查 Agent 工作空间是否存在。"""
+    ws = OCLAW_HOME / f'workspace-{agent_id}'
+    return ws.is_dir()
+
+
+# -- 三省六部 ↔ 实际 Agent 映射（基于 registry.json） --
+_registry_lock = threading.Lock()
+_registry_cache = None
+_registry_cache_mtime = 0
+
+def _load_registry():
+    """加载 registry.json，缓存 + 自动刷新。"""
+    global _registry_cache, _registry_cache_mtime
+    with _registry_lock:
+        p = _REGISTRY_PATH
+        try:
+            mtime = p.stat().st_mtime_ns
+            if _registry_cache is not None and mtime == _registry_cache_mtime:
+                return _registry_cache
+            raw = json.loads(p.read_text())
+            if not isinstance(raw, list):
+                raw = []
+            _registry_cache = raw
+            _registry_cache_mtime = mtime
+        except Exception:
+            if _registry_cache is None:
+                _registry_cache = []
+        return _registry_cache
+
+
+def _role_to_agent(role_id):
+    """将三省六部角色 ID（taizi/zhongshu/shangshu/libu 等）翻译为实际 OpenClaw Agent ID。
+    未在 registry 中注册的角色返回原 ID 作为 fallback。
+    """
+    registry = _load_registry()
+    for entry in registry:
+        if entry.get('courtId') == role_id:
+            return entry['id']
+    return role_id  # fallback: 保持向后兼容
+
+
+def _scan_actual_agent_ids():
+    """扫描 ~/.openclaw/agents/ 目录，返回所有真实 Agent ID 列表。
+    排除 openmoss-* 等基础设施 Agent。
+    """
+    agents_dir = OCLAW_HOME / 'agents'
+    if not agents_dir.is_dir():
+        return []
+    exclude_prefixes = ('openmoss-',)
+    result = []
+    for d in sorted(agents_dir.iterdir()):
+        if d.is_dir() and not d.name.startswith(exclude_prefixes):
+            result.append(d.name)
+    return result
+
+
+_SESSIONS_CACHE = {}
+_SESSIONS_CACHE_TTL = 2.0
+
+def _get_sessions_cache():
+    entry = _SESSIONS_CACHE.get('sessions_mapping')
+    if entry and (datetime.datetime.now() - entry['ts']).total_seconds() < _SESSIONS_CACHE_TTL:
+        return entry['value']
+    return None
+
+def _set_sessions_cache(value):
+    _SESSIONS_CACHE['sessions_mapping'] = {'value': value, 'ts': datetime.datetime.now()}
+
+
+def _epoch_to_iso_ts(ts):
+    """把 updatedAt/lastActivity 统一为 UTC ISO 字符串（末尾 Z）。
+    OpenClaw sessions list --json 的 updatedAt 是 epoch 毫秒 int（如 1785586731447），
+    前端期望字符串格式。数字/字符串/其他类型均安全处理。"""
+    if ts is None:
+        return ''
+    if isinstance(ts, (int, float)):
+        try:
+            if ts > 1e12:  # 毫秒
+                sec = ts / 1000.0
+            else:          # 秒
+                sec = float(ts)
+            return datetime.datetime.fromtimestamp(sec, datetime.timezone.utc).isoformat().replace('+00:00', 'Z')
+        except Exception:
+            return ''
+    if isinstance(ts, str):
+        return ts
+    return str(ts)
+
+
+def get_sessions_mapping():
+    """获取任务→Session 映射。
+    调用 openclaw sessions list 命令获取 session 列表，
+    结合 tasks_source.json 的任务列表，建立映射关系。
+    """
+    cached = _get_sessions_cache()
+    if cached is not None:
+        return cached
+
+    # 1. 获取 session 列表
+    sessions = []
+    try:
+        r = subprocess.run(
+            ['openclaw', 'sessions', 'list', '--all-agents', '--json', '--limit', '50'],
+            capture_output=True, text=True, timeout=30
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            data = json.loads(r.stdout)
+            if isinstance(data, list):
+                sessions = data
+            elif isinstance(data, dict):
+                sessions = data.get('sessions', data.get('data', []))
+    except Exception as e:
+        log.warning(f'sessions-mapping: openclaw sessions list 失败: {e}')
+        return {'ok': False, 'error': str(e)[:200]}
+
+    # 2. 加载任务列表
+    tasks = load_tasks()
+
+    # 3. 建立映射
+    # 看板任务 org 是部门名（规划部/审议部/执行办），session 的 agentId 是 agent id（guihua/shenyi/ld-r）
+    # 通过 registry.json 建立 courtId→agentId 映射
+    court_to_agents = {}  # courtId -> [agentId]
+    agent_to_court = {}  # agentId -> courtId
+    try:
+        reg_path = pathlib.Path(__file__).parent.parent / 'registry.json'
+        if reg_path.exists():
+            registry = _cache_read_json(reg_path, [])
+            for entry in registry:
+                cid = entry.get('courtId', '')
+                aid = entry.get('id', '')
+                if cid and aid:
+                    court_to_agents.setdefault(cid, []).append(aid)
+                    # 同时用中文名 courtTitle 做映射
+                    ct = entry.get('courtTitle', '')
+                    if ct:
+                        court_to_agents.setdefault(ct, []).append(aid)
+                    agent_to_court[aid] = cid
+    except Exception as e:
+        log.warning(f'sessions-mapping: 读取 registry 失败: {e}')
+
+    task_map = {}
+    for t in tasks:
+        tid = t.get('id', '')
+        if not tid:
+            continue
+        task_map[tid] = {
+            'id': tid,
+            'title': t.get('title', ''),
+            'state': t.get('state', ''),
+            'sessions': []
+        }
+
+    # 对每个 session，尝试关联到 task
+    for s in sessions:
+        sid = s.get('key', s.get('id', s.get('sessionKey', '')))
+        agent_id = s.get('agentId', '')
+        label = s.get('label', '')
+        display_name = s.get('displayName', '')
+        status = s.get('status', s.get('state', 'unknown'))
+        updated_at = _epoch_to_iso_ts(s.get('updatedAt', s.get('lastActivity', '')))
+        spawned_by = s.get('spawnedBy', '')
+        parent_key = s.get('parentSessionKey', '')
+        title = s.get('title', '')
+
+        # 用 spawnedBy、parentSessionKey、org/agentId 做关联
+        # 1. org 是部门名（规划部/审议部/执行办）→ 通过 court_to_agents 转为 agent id 列表
+        # 2. spawnedBy/parentSessionKey 包含 agent_id
+        # 3. label/displayName 包含任务 id
+        matched_task = None
+        for tid, tinfo in task_map.items():
+            task = next((t for t in tasks if t.get('id') == tid), None)
+            if not task:
+                continue
+            task_org = task.get('org', '')
+            # org→agent ids 映射：如果 session 的 agentId 在任务省份的 agent 列表中
+            if task_org and agent_id and court_to_agents.get(task_org):
+                if agent_id in court_to_agents[task_org]:
+                    matched_task = tid
+                    break
+            # spawnedBy 匹配省份中的某个 agent
+            if task_org and spawned_by and court_to_agents.get(task_org):
+                if spawned_by in court_to_agents[task_org]:
+                    matched_task = tid
+                    break
+            # session label 包含 task id
+            if tid in label or tid in display_name or tid in (title or ''):
+                matched_task = tid
+                break
+
+        if not matched_task:
+            continue
+
+        session_info = {
+            'key': sid,
+            'agentId': agent_id,
+            'label': label or display_name or '',
+            'status': status,
+            'updatedAt': updated_at,
+            'spawnedBy': spawned_by,
+            'parentSessionKey': parent_key,
+        }
+        task_map[matched_task]['sessions'].append(session_info)
+
+    # 4. 构建返回结果
+    result_tasks = [tinfo for tinfo in task_map.values() if tinfo['sessions']]
+    result = {'ok': True, 'tasks': result_tasks, 'totalSessions': len(sessions)}
+
+    _set_sessions_cache(result)
+    return result
+
+
+def get_system_health():
+    """获取系统健康状态。
+    返回 OpenClaw 版本、Node.js 版本、Gateway 状态、Dashboard 状态。
+    """
+    result = {
+        'openclaw_version': 'unknown',
+        'node_version': 'unknown',
+        'gateway_status': 'unknown',
+        'dashboard_status': 'unknown',
+        'timestamp': now_iso(),
+    }
+
+    # OpenClaw 版本
+    try:
+        r = subprocess.run(['openclaw', '--version'], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            result['openclaw_version'] = r.stdout.strip() or r.stderr.strip() or 'unknown'
+    except Exception as e:
+        log.warning(f'system-health: openclaw --version 失败: {e}')
+
+    # Node.js 版本
+    try:
+        r = subprocess.run(['node', '-v'], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            result['node_version'] = r.stdout.strip() or 'unknown'
+    except Exception as e:
+        log.warning(f'system-health: node -v 失败: {e}')
+
+    # Gateway 健康
+    try:
+        req = Request('http://127.0.0.1:18789/healthz', method='GET')
+        resp = urlopen(req, timeout=5)
+        if resp.status == 200:
+            result['gateway_status'] = 'ok'
+        else:
+            result['gateway_status'] = 'degraded'
+    except Exception:
+        result['gateway_status'] = 'unreachable'
+
+    # Dashboard 自身健康
+    try:
+        req = Request('http://127.0.0.1:7891/healthz', method='GET')
+        resp = urlopen(req, timeout=5)
+        if resp.status == 200:
+            result['dashboard_status'] = 'ok'
+        else:
+            result['dashboard_status'] = 'degraded'
+    except Exception:
+        result['dashboard_status'] = 'unreachable'
+
+    return result
+
+
+def get_agents_status():
+    """获取所有 Agent 的在线状态。
+    返回各 Agent 的:
+    - status: 'running' | 'idle' | 'offline' | 'unconfigured'
+    - lastActive: 最后活跃时间
+    - sessions: 会话数
+    - hasWorkspace: 工作空间是否存在
+    - processAlive: 是否有进程在运行
+    """
+    gateway_alive = _check_gateway_alive()
+    gateway_probe = _check_gateway_probe() if gateway_alive else False
+
+    registry = _load_registry()
+    reg_by_id = {e['id']: e for e in registry if isinstance(e, dict)}
+
+    # 第 1 步：扫描真实 Agent 目录
+    agent_ids = _scan_actual_agent_ids()
+
+    agents = []
+    seen_set = set()
+    for aid in agent_ids:
+        if aid in seen_set:
+            continue
+        seen_set.add(aid)
+
+        has_workspace = _check_agent_workspace(aid)
+        last_ts, sess_count, is_busy = _get_agent_session_status(aid)
+        process_alive = _check_agent_process(aid)
+
+        # 状态判定
+        if not has_workspace:
+            status = 'unconfigured'
+            status_label = '❌ 未配置'
+        elif not gateway_alive:
+            status = 'offline'
+            status_label = '🔴 Gateway 离线'
+        elif process_alive or is_busy:
+            status = 'running'
+            status_label = '🟢 运行中'
+        elif last_ts > 0:
+            now_ms = int(datetime.datetime.now().timestamp() * 1000)
+            age_ms = now_ms - last_ts
+            if age_ms <= 10 * 60 * 1000:  # 10分钟内
+                status = 'idle'
+                status_label = '🟡 待命'
+            elif age_ms <= 3600 * 1000:  # 1小时内
+                status = 'idle'
+                status_label = '⚪ 空闲'
+            else:
+                status = 'idle'
+                status_label = '⚪ 休眠'
+        else:
+            status = 'idle'
+            status_label = '⚪ 无记录'
+
+        # 格式化最后活跃时间
+        last_active_str = None
+        if last_ts > 0:
+            try:
+                last_active_str = datetime.datetime.fromtimestamp(
+                    last_ts / 1000
+                ).strftime('%m-%d %H:%M')
+            except Exception:
+                pass
+
+        # 从 registry 取元数据
+        reg_entry = reg_by_id.get(aid, {})
+        label = reg_entry.get('name', aid)
+        emoji = reg_entry.get('emoji', '🤖')
+        role_text = reg_entry.get('role', '')
+        duty_text = reg_entry.get('duty', '')
+        court_id = reg_entry.get('courtId', '')
+        court_title = reg_entry.get('courtTitle', '')
+
+        agents.append({
+            'id': aid,
+            'label': label,
+            'emoji': emoji,
+            'role': role_text,
+            'duty': duty_text,
+            'status': status,
+            'statusLabel': status_label,
+            'lastActive': last_active_str,
+            'lastActiveTs': last_ts,
+            'sessions': sess_count,
+            'hasWorkspace': has_workspace,
+            'processAlive': process_alive,
+            'courtId': court_id,
+            'courtTitle': court_title,
+        })
+
+    # 第 2 步：构建三省六部覆盖视图
+    # 将 _AGENT_DEPTS 中的角色与 registry 中的实际 Agent 关联
+    dept_role_map = {}  # courtId → role metadata from _AGENT_DEPTS
+    for d in _AGENT_DEPTS:
+        dept_role_map[d['id']] = d
+
+    court_coverage = []
+    for d in _AGENT_DEPTS:
+        court_id = d['id']
+        # 在 registry 中找 courtId 匹配的 Agent
+        matched_entry = None
+        for e in registry:
+            if isinstance(e, dict) and e.get('courtId') == court_id:
+                matched_entry = e
+                break
+
+        # 在 agents 列表中找实际状态（如果已扫描到）
+        matched_agent = None
+        if matched_entry:
+            for a in agents:
+                if a['id'] == matched_entry['id']:
+                    matched_agent = a
+                    break
+
+        covered = 'covered' if (matched_entry and (matched_agent and matched_agent['hasWorkspace'])) else 'uncovered'
+        court_coverage.append({
+            'id': court_id,
+            'label': d['label'],
+            'emoji': d['emoji'],
+            'role': d['role'],
+            'rank': d['rank'],
+            'covered': covered,
+            'agentId': matched_entry['id'] if matched_entry else None,
+            'agentName': matched_entry.get('name', '') if matched_entry else '',
+            'agentStatus': matched_agent['status'] if matched_agent else 'unconfigured',
+        })
+
+    return {
+        'ok': True,
+        'gateway': {
+            'alive': gateway_alive,
+            'probe': gateway_probe,
+            'status': '🟢 运行中' if gateway_probe else ('🟡 进程在但无响应' if gateway_alive else '🔴 未启动'),
+        },
+        'agents': agents,
+        'courtCoverage': court_coverage,
+        'checkedAt': now_iso(),
+    }
+
+
+def wake_agent(agent_id, message=''):
+    """唤醒指定 Agent，发送一条心跳/唤醒消息。
+    支持三省六部角色 ID（taizi/zhongshu/shangshu 等），自动翻译为实际 Agent ID。
+    """
+    # 角色 ID → 实际 Agent ID 翻译
+    real_id = _role_to_agent(agent_id)
+    if real_id != agent_id:
+        log.info(f'🔀 角色 ID 翻译: {agent_id} → {real_id}')
+        agent_id = real_id
+
+    if not _SAFE_NAME_RE.match(agent_id):
+        return {'ok': False, 'error': f'agent_id 非法: {agent_id}'}
+    if not _check_agent_workspace(agent_id):
+        return {'ok': False, 'error': f'{agent_id} 工作空间不存在，请先配置'}
+    if not _check_gateway_alive():
+        return {'ok': False, 'error': 'Gateway 未启动，请先运行 openclaw gateway start'}
+
+    # agent_id 直接作为 runtime_id（openclaw agents list 中的注册名）
+    runtime_id = agent_id
+    msg = message or f'🔔 系统心跳检测 — 请回复 OK 确认在线。当前时间: {now_iso()}'
+
+    # ⚡ 修复：taizi/main 是当前session的总办，不需要也不能通过子进程唤醒
+    if runtime_id == 'main':
+        log.info(f'ℹ️ 跳过 taizi/main 子进程唤醒（总办已在当前session运行中）')
+        return {'ok': True, 'message': f'{agent_id} 是当前总办，已在运行中，无需唤醒'}
+
+    def do_wake():
+        try:
+            cmd = ['openclaw', 'agent', '--agent', runtime_id, '-m', msg, '--timeout', str(DISPATCH_AGENT_TIMEOUT)]
+            log.info(f'🔔 唤醒 {agent_id}（异步投递）...')
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            # 等待1-3秒确认进程启动（不等待agent完成）
+            import time as _time
+            _started = False
+            for _i in range(3):
+                if proc.poll() is None:
+                    _started = True
+                    break
+                _time.sleep(1)
+            if _started:
+                log.info(f'✅ {agent_id} 唤醒已投递（agent处理中）')
+            elif proc.returncode == 0:
+                log.info(f'✅ {agent_id} 已唤醒（同步返回）')
+            else:
+                err = proc.stderr.read()[:200] if proc.stderr else '未知错误'
+                log.warning(f'⚠️ {agent_id} 唤醒失败: {err}')
+            # 清理僵尸进程：确认投递后快速释放，不等待 agent 回复
+            def _cleanup(p=proc, aid=agent_id):
+                try:
+                    p.wait(timeout=DISPATCH_CLEANUP_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    log.warning(f'⚠️ {aid} 清理超时，强制终止')
+                    p.kill()
+                    p.wait(timeout=5)
+            threading.Thread(target=_cleanup, daemon=True).start()
+        except Exception as e:
+            log.warning(f'⚠️ {agent_id} 唤醒异常: {e}')
+    threading.Thread(target=do_wake, daemon=True).start()
+
+    return {'ok': True, 'message': f'{agent_id} 唤醒指令已发出，约10-30秒后生效'}
+
+
+# ══ Agent 实时活动读取 ══
+
+# 状态 → agent_id 映射
+_STATE_AGENT_MAP = {
+    'Taizi': 'taizi',
+    'Zhongshu': 'zhongshu',
+    'Menxia': 'menxia',
+    'Assigned': 'shangshu',
+    'Doing': None,         # 六部，需从 org 推断
+    'Review': 'shangshu',
+    'Next': None,          # 待执行，从 org 推断
+    'Pending': 'zhongshu', # 待处理，默认规划部
+}
+_ORG_AGENT_MAP = {
+    '内容部': 'libu', '交付汇总处': 'hubu', '开发部': 'bingbu',
+    '质控部': 'xingbu', '设计部': 'gongbu', '人力路由处': 'libu_hr',
+    '规划部': 'zhongshu', '审议部': 'menxia', '执行办': 'shangshu',
+    # 兼容历史数据中的古名 org
+    '礼部': 'libu', '户部': 'hubu', '兵部': 'bingbu', '刑部': 'xingbu',
+    '工部': 'gongbu', '吏部': 'libu_hr', '中书省': 'zhongshu',
+    '门下省': 'menxia', '尚书省': 'shangshu',
+}
+
+_TERMINAL_STATES = {'Done', 'Cancelled'}
+
+
+def _parse_iso(ts):
+    if not ts or not isinstance(ts, str):
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(ts.replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _ensure_aware(dt):
+    """确保 datetime 有时区信息，naive → UTC"""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=datetime.timezone.utc)
+    return dt
+
+
+def _safe_delta_sec(dt_a, dt_b):
+    """安全计算两个 datetime 的秒差，自动统一时区"""
+    a = _ensure_aware(dt_a)
+    b = _ensure_aware(dt_b)
+    if a is None or b is None:
+        return 0
+    return max(0, int((a - b).total_seconds()))
+
+
+def _ensure_scheduler(task):
+    sched = task.setdefault('_scheduler', {})
+    if not isinstance(sched, dict):
+        sched = {}
+        task['_scheduler'] = sched
+    # JJC-AUTO 任务是 Agent 会话的被动镜像，默认不启用调度器
+    task_id = task.get('id', '')
+    auto_task = str(task_id).startswith('JJC-AUTO')
+    sched.setdefault('enabled', not auto_task)
+    sched.setdefault('stallThresholdSec', 600)
+    sched.setdefault('maxRetry', 2)
+    sched.setdefault('retryCount', 0)
+    sched.setdefault('escalationLevel', 0)
+    sched.setdefault('autoRollback', True)
+    if not sched.get('lastProgressAt'):
+        sched['lastProgressAt'] = task.get('updatedAt') or now_iso()
+    if 'stallSince' not in sched:
+        sched['stallSince'] = None
+    if 'lastDispatchStatus' not in sched:
+        sched['lastDispatchStatus'] = 'idle'
+    if 'snapshot' not in sched:
+        sched['snapshot'] = {
+            'state': task.get('state', ''),
+            'org': task.get('org', ''),
+            'now': task.get('now', ''),
+            'savedAt': now_iso(),
+            'note': 'init',
+        }
+    return sched
+
+
+def _scheduler_add_flow(task, remark, to=''):
+    task.setdefault('flow_log', []).append({
+        'at': now_iso(),
+        'from': '总控调度',
+        'to': to or _modern(task.get('org', '')),
+        'remark': f'🧭 {remark}'
+    })
+
+
+def _scheduler_snapshot(task, note=''):
+    sched = _ensure_scheduler(task)
+    sched['snapshot'] = {
+        'state': task.get('state', ''),
+        'org': task.get('org', ''),
+        'now': task.get('now', ''),
+        'savedAt': now_iso(),
+        'note': note or 'snapshot',
+    }
+
+
+def _scheduler_mark_progress(task, note=''):
+    sched = _ensure_scheduler(task)
+    sched['lastProgressAt'] = now_iso()
+    sched['stallSince'] = None
+    sched['retryCount'] = 0
+    sched['escalationLevel'] = 0
+    sched['rollbackCount'] = 0
+    sched['lastEscalatedAt'] = None
+    if note:
+        _scheduler_add_flow(task, f'进展确认：{note}')
+
+
+def _resolve_openclaw_bin():
+    """Return the OpenClaw CLI path used by dashboard dispatch.
+
+    On Windows, npm-installed CLIs are commonly exposed as .cmd shims.  Using
+    shutil.which lets Python resolve that shim before subprocess runs.
+    """
+    configured = os.environ.get('OPENCLAW_BIN', '').strip()
+    if configured:
+        return configured
+    return shutil.which('openclaw')
+
+
+def _update_task_scheduler(task_id, updater):
+    """Atomically update a task's scheduler state.
+
+    Uses ``modify_task`` to hold the file lock for the entire
+    read-modify-write cycle, preventing concurrent dispatch threads and
+    the periodic scanner from clobbering each other's writes.
+    """
+    def _apply(task):
+        sched = _ensure_scheduler(task)
+        updater(task, sched)
+
+    return modify_task(task_id, _apply)
+
+
+def get_scheduler_state(task_id):
+    tasks = load_tasks()
+    task = next((t for t in tasks if t.get('id') == task_id), None)
+    if not task:
+        return {'ok': False, 'error': f'任务 {task_id} 不存在'}
+    sched = _ensure_scheduler(task)
+    last_progress = _parse_iso(sched.get('lastProgressAt') or task.get('updatedAt'))
+    now_dt = datetime.datetime.now(datetime.timezone.utc)
+    stalled_sec = _safe_delta_sec(now_dt, last_progress)
+    return {
+        'ok': True,
+        'taskId': task_id,
+        'state': task.get('state', ''),
+        'org': task.get('org', ''),
+        'scheduler': sched,
+        'stalledSec': stalled_sec,
+        'checkedAt': now_iso(),
+    }
+
+
+def handle_scheduler_retry(task_id, reason=''):
+    # Pre-check before acquiring lock (avoids holding lock for error paths)
+    tasks = load_tasks()
+    task = next((t for t in tasks if t.get('id') == task_id), None)
+    if not task:
+        return {'ok': False, 'error': f'任务 {task_id} 不存在'}
+    state = task.get('state', '')
+    if state in _TERMINAL_STATES or state == 'Blocked':
+        return {'ok': False, 'error': f'任务 {task_id} 当前状态 {state} 不支持重试'}
+
+    result = {'retryCount': 0, 'state': state}
+
+    def _apply(task):
+        cur = task.get('state', '')
+        if cur in _TERMINAL_STATES or cur == 'Blocked':
+            return  # state changed between pre-check and lock; skip
+        sched = _ensure_scheduler(task)
+        sched['retryCount'] = int(sched.get('retryCount') or 0) + 1
+        sched['lastRetryAt'] = now_iso()
+        sched['lastDispatchTrigger'] = 'taizi-retry'
+        _scheduler_add_flow(task, f'触发重试第{sched["retryCount"]}次：{reason or "超时未推进"}')
+        result['retryCount'] = sched['retryCount']
+        result['state'] = cur
+
+    modify_task(task_id, _apply)
+
+    dispatch_for_state(task_id, task, result['state'], trigger='taizi-retry')
+    return {'ok': True, 'message': f'{task_id} 已触发重试派发', 'retryCount': result['retryCount']}
+
+
+def handle_scheduler_escalate(task_id, reason=''):
+    tasks = load_tasks()
+    task = next((t for t in tasks if t.get('id') == task_id), None)
+    if not task:
+        return {'ok': False, 'error': f'任务 {task_id} 不存在'}
+    state = task.get('state', '')
+    if state in _TERMINAL_STATES:
+        return {'ok': False, 'error': f'任务 {task_id} 已结束，无需升级'}
+
+    sched = _ensure_scheduler(task)
+    current_level = int(sched.get('escalationLevel') or 0)
+    next_level = min(current_level + 1, 2)
+    target_role = 'menxia' if next_level == 1 else 'shangshu'
+    target_label = '审议部' if next_level == 1 else '执行办'
+    target_agent = _role_to_agent(target_role)
+
+    sched['escalationLevel'] = next_level
+    sched['lastEscalatedAt'] = now_iso()
+    _scheduler_add_flow(task, f'升级到{target_label}协调：{reason or "任务停滞"}', to=target_label)
+    task['updatedAt'] = now_iso()
+    save_tasks(tasks)
+
+    msg = (
+        f'🧭 总控调度升级通知\n'
+        f'任务ID: {task_id}\n'
+        f'当前状态: {state}\n'
+        f'停滞处理: 请你介入协调推进\n'
+        f'原因: {reason or "任务超过阈值未推进"}\n'
+        f'⚠️ 看板已有任务，请勿重复创建。'
+    )
+    wake_agent(target_agent, msg)
+
+    return {'ok': True, 'message': f'{task_id} 已升级至{target_label}', 'escalationLevel': next_level}
+
+
+def handle_scheduler_rollback(task_id, reason=''):
+    # Pre-check before acquiring lock
+    tasks = load_tasks()
+    task = next((t for t in tasks if t.get('id') == task_id), None)
+    if not task:
+        return {'ok': False, 'error': f'任务 {task_id} 不存在'}
+    sched = _ensure_scheduler(task)
+    snapshot = sched.get('snapshot') or {}
+    snap_state = snapshot.get('state')
+    if not snap_state:
+        return {'ok': False, 'error': f'任务 {task_id} 无可用回滚快照'}
+
+    result = {'snap_state': snap_state}
+
+    def _apply(task):
+        sched = _ensure_scheduler(task)
+        snapshot = sched.get('snapshot') or {}
+        s_state = snapshot.get('state')
+        if not s_state:
+            return  # snapshot cleared between pre-check and lock
+        old_state = task.get('state', '')
+        task['state'] = s_state
+        task['org'] = snapshot.get('org', task.get('org', ''))
+        task['now'] = f'↩️ 总控调度自动回滚：{reason or "恢复到上个稳定节点"}'
+        task['block'] = '无'
+        sched['retryCount'] = 0
+        sched['escalationLevel'] = 0
+        sched['stallSince'] = None
+        sched['lastProgressAt'] = now_iso()
+        _scheduler_add_flow(task, f'执行回滚：{old_state} → {s_state}，原因：{reason or "停滞恢复"}')
+        result['snap_state'] = s_state
+
+    modify_task(task_id, _apply)
+
+    if result['snap_state'] not in _TERMINAL_STATES:
+        dispatch_for_state(task_id, task, result['snap_state'], trigger='taizi-rollback')
+
+    return {'ok': True, 'message': f'{task_id} 已回滚到 {result["snap_state"]}'}
+
+
+def handle_scheduler_scan(threshold_sec=600):
+    """Periodic stall scanner — runs in a background thread.
+
+    Uses ``modify_tasks`` to hold the file lock during the mutation phase,
+    preventing concurrent dispatch callbacks and HTTP handlers from
+    clobbering each other's writes (fixes TOCTOU race between the old
+    ``load_tasks()`` / ``save_tasks()`` pair).
+
+    Side-effects (dispatch, escalation wake) are executed *after* the lock
+    is released so they don't block other writers.
+    """
+    threshold_sec = max(60, int(threshold_sec or 600))
+    now_dt = datetime.datetime.now(datetime.timezone.utc)
+    # Collect dispatch/escalation work to execute after the lock is released
+    pending_retries = []
+    pending_escalates = []
+    pending_rollbacks = []
+    actions = []
+
+    def _scan(tasks):
+        changed = False
+        for task in tasks:
+            task_id = task.get('id', '')
+            state = task.get('state', '')
+            if not task_id or state in _TERMINAL_STATES or task.get('archived'):
+                continue
+            if state == 'Blocked':
+                continue
+            # JJC-AUTO 任务是 Agent 会话的被动镜像，不应被调度器派发
+            # 它们只是告诉看板「这个 Agent 刚才在活跃」，不是待办工作
+            # 但如果已完成且停滞 > 1h，自动归档
+            if str(task_id).startswith('JJC-AUTO'):
+                source_meta = task.get('sourceMeta') or {}
+                if source_meta and not source_meta.get('abortedLastRun'):
+                    last_ms = source_meta.get('updatedAt')
+                    if last_ms:
+                        last_dt = datetime.datetime.fromtimestamp(last_ms / 1000, tz=datetime.timezone.utc)
+                        stalled_sec = _safe_delta_sec(now_dt, last_dt)
+                        if stalled_sec > 3600:
+                            old_state = task.get('state', '?')
+                            task['state'] = 'Done'
+                            task['now'] = '✅ 自动归档（AUTO任务已完成）'
+                            sched = _ensure_scheduler(task)
+                            sched['enabled'] = False
+                            _scheduler_add_flow(task, f'总控巡检：AUTO任务已完成（原状态: {old_state}），自动归档')
+                            task['updatedAt'] = now_iso()
+                            actions.append({'taskId': task_id, 'action': 'auto-archive', 'stalledHours': stalled_sec // 3600})
+                            changed = True
+                continue
+
+            sched = _ensure_scheduler(task)
+            task_threshold = int(sched.get('stallThresholdSec') or threshold_sec)
+            last_progress = _parse_iso(sched.get('lastProgressAt') or task.get('updatedAt'))
+            if not last_progress:
+                continue
+            stalled_sec = _safe_delta_sec(now_dt, last_progress)
+            if stalled_sec < task_threshold:
+                continue
+
+            if not sched.get('stallSince'):
+                sched['stallSince'] = now_iso()
+                changed = True
+
+            retry_count = int(sched.get('retryCount') or 0)
+            max_retry = max(0, int(sched.get('maxRetry') or 1))
+            level = int(sched.get('escalationLevel') or 0)
+
+            if retry_count < max_retry:
+                sched['retryCount'] = retry_count + 1
+                sched['lastRetryAt'] = now_iso()
+                sched['lastDispatchTrigger'] = 'taizi-scan-retry'
+                _scheduler_add_flow(task, f'停滞{stalled_sec}秒，触发自动重试第{sched["retryCount"]}次')
+                pending_retries.append((task_id, state))
+                actions.append({'taskId': task_id, 'action': 'retry', 'stalledSec': stalled_sec})
+                changed = True
+                continue
+
+            if level < 2:
+                next_level = level + 1
+                target_role = 'menxia' if next_level == 1 else 'shangshu'
+                target_label = '审议部' if next_level == 1 else '执行办'
+                target_agent = _role_to_agent(target_role)
+                sched['escalationLevel'] = next_level
+                sched['lastEscalatedAt'] = now_iso()
+                _scheduler_add_flow(task, f'停滞{stalled_sec}秒，升级至{target_label}协调', to=target_label)
+                pending_escalates.append((task_id, state, target_agent, target_label, stalled_sec))
+                actions.append({'taskId': task_id, 'action': 'escalate', 'to': target_label, 'stalledSec': stalled_sec})
+                changed = True
+                continue
+
+            if sched.get('autoRollback', True):
+                rollback_count = int(sched.get('rollbackCount') or 0)
+                max_rollback = int(sched.get('maxRollback') or 3)
+                snapshot = sched.get('snapshot') or {}
+                snap_state = snapshot.get('state')
+                if rollback_count >= max_rollback:
+                    if state != 'Blocked':
+                        task['state'] = 'Blocked'
+                        task['now'] = f'🚫 连续回滚{rollback_count}次仍无法推进，已自动挂起'
+                        task['block'] = f'连续停滞且回滚{rollback_count}次均失败，需人工介入'
+                        sched['stallSince'] = None
+                        _scheduler_add_flow(task, f'连续回滚{rollback_count}次，自动挂起等待人工介入')
+                        actions.append({'taskId': task_id, 'action': 'blocked', 'reason': f'max rollback {rollback_count}'})
+                        changed = True
+                elif snap_state and snap_state != state:
+                    old_state = state
+                    task['state'] = snap_state
+                    task['org'] = snapshot.get('org', task.get('org', ''))
+                    task['now'] = '↩️ 总控调度自动回滚到稳定节点'
+                    task['block'] = '无'
+                    sched['retryCount'] = 0
+                    sched['escalationLevel'] = 0
+                    sched['rollbackCount'] = rollback_count + 1
+                    sched['stallSince'] = None
+                    sched['lastProgressAt'] = now_iso()
+                    _scheduler_add_flow(task, f'连续停滞，自动回滚：{old_state} → {snap_state}（第{rollback_count + 1}次）')
+                    pending_rollbacks.append((task_id, snap_state))
+                    actions.append({'taskId': task_id, 'action': 'rollback', 'toState': snap_state})
+                    changed = True
+
+        return tasks  # always return — atomic_json_update requires it
+
+    modify_tasks(_scan)
+
+    # --- Side-effects: dispatch & escalation (outside the file lock) ---
+
+    # Re-read tasks for dispatch context (the task objects from _scan are
+    # no longer held under the lock, but dispatch only needs id + state +
+    # title which are immutable at this point).
+    tasks = load_tasks()
+
+    for task_id, state in pending_retries:
+        retry_task = next((t for t in tasks if t.get('id') == task_id), None)
+        if retry_task:
+            dispatch_for_state(task_id, retry_task, state, trigger='taizi-scan-retry')
+
+    for task_id, state, target, target_label, stalled_sec in pending_escalates:
+        msg = (
+            f'🧭 总控调度升级通知\n'
+            f'任务ID: {task_id}\n'
+            f'当前状态: {state}\n'
+            f'已停滞: {stalled_sec} 秒\n'
+            f'请立即介入协调推进\n'
+            f'⚠️ 看板已有任务，请勿重复创建。'
+        )
+        wake_agent(target, msg)
+
+    for task_id, state in pending_rollbacks:
+        rollback_task = next((t for t in tasks if t.get('id') == task_id), None)
+        if rollback_task and state not in _TERMINAL_STATES:
+            dispatch_for_state(task_id, rollback_task, state, trigger='taizi-auto-rollback')
+
+    return {
+        'ok': True,
+        'thresholdSec': threshold_sec,
+        'actions': actions,
+        'count': len(actions),
+        'checkedAt': now_iso(),
+    }
+
+
+def handle_smart_unstuck(threshold_hours=12):
+    """智能解卡：一键清理超时任务或强制续推。
+    
+    规则：
+    - 停滞 > threshold_hours 小时 → 自动取消（清理）
+    - 停滞 ≤ threshold_hours 小时 → 重置调度器 + 强制派发（续推）
+    
+    只处理非终态、非归档的人工 JJC 任务。
+    """
+    threshold_sec = max(1, int(threshold_hours or 12)) * 3600
+    now_dt = datetime.datetime.now(datetime.timezone.utc)
+    actions = []
+    pending_dispatches = []
+
+    def _unstuck(tasks):
+        for task in tasks:
+            task_id = task.get('id', '')
+            state = task.get('state', '')
+            if not task_id or state in _TERMINAL_STATES or task.get('archived'):
+                continue
+            # JJC-AUTO 任务：已完成则自动归档，否则跳过
+            if str(task_id).startswith('JJC-AUTO'):
+                source_meta = task.get('sourceMeta') or {}
+                if source_meta and not source_meta.get('abortedLastRun'):
+                    # 用 sourceMeta.updatedAt（ms）判断最后活跃时间
+                    last_ms = source_meta.get('updatedAt')
+                    if last_ms:
+                        last_dt = datetime.datetime.fromtimestamp(last_ms / 1000, tz=datetime.timezone.utc)
+                        stalled_sec = _safe_delta_sec(now_dt, last_dt)
+                        if stalled_sec > 3600:
+                            old_state = task.get('state', '?')
+                            task['state'] = 'Done'
+                            task['now'] = '✅ 自动归档（AUTO任务已完成）'
+                            sched = _ensure_scheduler(task)
+                            sched['enabled'] = False
+                            _scheduler_add_flow(task, f'智能解卡：AUTO任务已完成（原状态: {old_state}），自动归档')
+                            task['updatedAt'] = now_iso()
+                            actions.append({'taskId': task_id, 'action': 'auto-archive', 'stalledHours': stalled_sec // 3600})
+                            continue
+                continue
+
+            sched = _ensure_scheduler(task)
+            last_progress = _parse_iso(sched.get('lastProgressAt') or task.get('updatedAt'))
+            if not last_progress:
+                continue
+            stalled_sec = _safe_delta_sec(now_dt, last_progress)
+
+            if stalled_sec > threshold_sec:
+                # 超时 → 清理
+                old_state = task.get('state', '?')
+                task['state'] = 'Cancelled'
+                task['block'] = f'停滞 {stalled_sec // 3600}h，自动清理'
+                task['now'] = f'🚫 已停滞 {stalled_sec // 3600}h，智能解卡自动取消'
+                sched['enabled'] = False
+                _scheduler_add_flow(task, f'智能解卡：停滞{stalled_sec // 3600}h → 自动取消（原状态: {old_state}）')
+                task['updatedAt'] = now_iso()
+                actions.append({'taskId': task_id, 'action': 'cancel', 'stalledHours': stalled_sec // 3600, 'oldState': old_state})
+            else:
+                # 未超时 → 重置调度器 + 强制续推
+                # 停滞 < 30 分钟的任务跳过续推，避免误触刚创建的正常任务
+                if stalled_sec < 1800:
+                    continue
+                sched['retryCount'] = 0
+                sched['escalationLevel'] = 0
+                sched['rollbackCount'] = 0
+                sched['stallSince'] = None
+                sched['lastProgressAt'] = now_iso()
+                sched['enabled'] = True
+                task['block'] = '无'
+                task['now'] = '🔄 智能解卡：重置调度器，强制续推'
+                _scheduler_add_flow(task, f'智能解卡：重置调度器（停滞{stalled_sec}s），强制续推')
+                task['updatedAt'] = now_iso()
+                pending_dispatches.append((task_id, state))
+                actions.append({'taskId': task_id, 'action': 'force-retry', 'stalledSec': stalled_sec})
+
+        return tasks
+
+    modify_tasks(_unstuck)
+
+    # 锁外派发
+    tasks = load_tasks()
+    for task_id, state in pending_dispatches:
+        task = next((t for t in tasks if t.get('id') == task_id), None)
+        if task and state not in _TERMINAL_STATES:
+            dispatch_for_state(task_id, task, state, trigger='smart-unstuck')
+
+    return {
+        'ok': True,
+        'thresholdHours': threshold_hours,
+        'actions': actions,
+        'count': len(actions),
+        'cancelled': sum(1 for a in actions if a['action'] == 'cancel'),
+        'retried': sum(1 for a in actions if a['action'] == 'force-retry'),
+        'checkedAt': now_iso(),
+    }
+
+
+def _startup_recover_queued_dispatches():
+    """服务启动后扫描 lastDispatchStatus=queued 的任务，重新派发。
+    解决：kill -9 重启导致派发线程中断、任务永久卡住的问题。"""
+    tasks = load_tasks()
+    recovered = 0
+    for task in tasks:
+        task_id = task.get('id', '')
+        state = task.get('state', '')
+        if not task_id or state in _TERMINAL_STATES or task.get('archived'):
+            continue
+        sched = task.get('_scheduler') or {}
+        if sched.get('lastDispatchStatus') == 'queued':
+            log.info(f'🔄 启动恢复: {task_id} 状态={state} 上次派发未完成，重新派发')
+            sched['lastDispatchTrigger'] = 'startup-recovery'
+            dispatch_for_state(task_id, task, state, trigger='startup-recovery')
+            recovered += 1
+    if recovered:
+        log.info(f'✅ 启动恢复完成: 重新派发 {recovered} 个任务')
+    else:
+        log.info(f'✅ 启动恢复: 无需恢复')
+
+
+def handle_repair_flow_order():
+    """修复历史任务中首条流转为"老板->规划部"的错序问题。
+    兼容现代名与历史古名（经 _modern() 归一后判断）。"""
+    tasks = load_tasks()
+    fixed = 0
+    fixed_ids = []
+
+    for task in tasks:
+        task_id = task.get('id', '')
+        if not task_id.startswith('JJC-'):
+            continue
+        flow_log = task.get('flow_log') or []
+        if not flow_log:
+            continue
+
+        first = flow_log[0]
+        first_from = _modern(first.get('from', ''))
+        first_to = _modern(first.get('to', ''))
+        if first_from != '老板' or first_to != '规划部':
+            continue
+
+        first['to'] = '总办'
+        remark = first.get('remark', '')
+        if isinstance(remark, str) and remark.startswith('下旨：'):
+            first['remark'] = remark
+
+        if task.get('state') == 'Zhongshu' and _modern(task.get('org', '')) == '规划部' and len(flow_log) == 1:
+            task['state'] = 'Taizi'
+            task['org'] = '总办'
+            task['now'] = '等待总办分拣'
+
+        task['updatedAt'] = now_iso()
+        fixed += 1
+        fixed_ids.append(task_id)
+
+    if fixed:
+        save_tasks(tasks)
+
+    return {
+        'ok': True,
+        'count': fixed,
+        'taskIds': fixed_ids[:80],
+        'more': max(0, fixed - 80),
+        'checkedAt': now_iso(),
+    }
+
+
+def handle_deep_clean():
+    """深度清理：终止僵尸Agent进程 + 清理过期session文件。"""
+    import subprocess, time
+
+    killed = 0
+    killed_pids = []
+    deleted_files = 0
+    freed_bytes = 0
+
+    # 1. 终止超过2小时的僵尸 openclaw-agent 进程
+    try:
+        result = subprocess.run(
+            ['ps', 'aux'],
+            capture_output=True, text=True, timeout=10
+        )
+        lines = result.stdout.split('\n')
+        now = time.time()
+        for line in lines:
+            if 'openclaw-agent' not in line or 'grep' in line:
+                continue
+            parts = line.split()
+            if len(parts) < 11:
+                continue
+            try:
+                pid = int(parts[1])
+            except (ValueError, IndexError):
+                continue
+            # 跳过当前 gateway 进程
+            if 'gateway' in line or 'openclaw.*gateway' in line:
+                continue
+            # 解析启动时间
+            start_str = ' '.join(parts[9:11]) if len(parts) > 10 else ''
+            # 如果包含日期而非时间（如 "Fri" 开头），说明是几天前的
+            # 或者 RSS 很大但无活动
+            try:
+                # 检查 CPU time - 如果进程运行了很久但 CPU 很低，可能是僵尸
+                cpu_time = parts[10] if len(parts) > 10 else ''
+            except:
+                cpu_time = ''
+            # 简单策略：终止所有不是 gateway 的 openclaw-agent 进程
+            # 但保留当前会话的 main agent
+            if 'main' in line and 'gateway' not in line:
+                continue  # 保留 main
+            try:
+                subprocess.run(['kill', '-9', str(pid)], capture_output=True, timeout=5)
+                killed += 1
+                killed_pids.append(pid)
+            except:
+                pass
+    except Exception as e:
+        log.warning(f'deep-clean: kill agents failed: {e}')
+
+    # 2. 清理过期 session 文件（调用 session_cleaner.py）
+    try:
+        cleaner = SCRIPTS / 'session_cleaner.py'
+        if cleaner.exists():
+            result = subprocess.run(
+                [python_bin(), str(cleaner), '--json'],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode == 0:
+                try:
+                    clean_stats = json.loads(result.stdout)
+                    deleted_files = clean_stats.get('deleted_files', 0)
+                    freed_bytes = clean_stats.get('freed_bytes', 0)
+                except:
+                    pass
+    except Exception as e:
+        log.warning(f'deep-clean: session cleanup failed: {e}')
+
+    # 3. 清理 Gateway 的 sessions.json 中过期条目
+    try:
+        sessions_file = OPENCLAW_HOME / 'sessions.json'
+        if sessions_file.exists():
+            data = json.loads(sessions_file.read_text())
+            if isinstance(data, dict):
+                now_ms = int(time.time() * 1000)
+                before = len(data)
+                # 移除超过7天无活动的 session
+                keys_to_remove = []
+                for k, v in data.items():
+                    updated = v.get('updatedAt', 0) if isinstance(v, dict) else 0
+                    if isinstance(updated, (int, float)) and (now_ms - updated) > 7 * 86400 * 1000:
+                        keys_to_remove.append(k)
+                for k in keys_to_remove:
+                    del data[k]
+                if len(keys_to_remove) > 0:
+                    sessions_file.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+                    log.info(f'deep-clean: removed {len(keys_to_remove)} stale sessions from sessions.json')
+    except Exception as e:
+        log.warning(f'deep-clean: sessions.json cleanup failed: {e}')
+
+    freed_mb = round(freed_bytes / 1048576, 1) if freed_bytes else 0
+    return {
+        'ok': True,
+        'killed': killed,
+        'killedPids': killed_pids[:20],
+        'deletedFiles': deleted_files,
+        'freedBytes': freed_bytes,
+        'freedMb': freed_mb,
+        'checkedAt': now_iso(),
+    }
+
+
+def _collect_message_text(msg):
+    """收集消息中的可检索文本，用于 task_id/关键词过滤。"""
+    parts = []
+    for c in msg.get('content', []) or []:
+        ctype = c.get('type')
+        if ctype == 'text' and c.get('text'):
+            parts.append(str(c.get('text', '')))
+        elif ctype == 'thinking' and c.get('thinking'):
+            parts.append(str(c.get('thinking', '')))
+        elif ctype == 'tool_use':
+            parts.append(json.dumps(c.get('input', {}), ensure_ascii=False))
+    details = msg.get('details') or {}
+    for key in ('output', 'stdout', 'stderr', 'message'):
+        val = details.get(key)
+        if isinstance(val, str) and val:
+            parts.append(val)
+    return ''.join(parts)
+
+
+def _parse_activity_entry(item):
+    """将 session jsonl 的 message 统一解析成看板活动条目。"""
+    msg = item.get('message') or {}
+    role = str(msg.get('role', '')).strip().lower()
+    ts = item.get('timestamp', '')
+
+    if role == 'assistant':
+        text = ''
+        thinking = ''
+        tool_calls = []
+        for c in msg.get('content', []) or []:
+            if c.get('type') == 'text' and c.get('text') and not text:
+                text = str(c.get('text', '')).strip()
+            elif c.get('type') == 'thinking' and c.get('thinking') and not thinking:
+                thinking = str(c.get('thinking', '')).strip()[:200]
+            elif c.get('type') == 'tool_use':
+                tool_calls.append({
+                    'name': c.get('name', ''),
+                    'input_preview': json.dumps(c.get('input', {}), ensure_ascii=False)[:100]
+                })
+        if not (text or thinking or tool_calls):
+            return None
+        entry = {'at': ts, 'kind': 'assistant'}
+        if text:
+            entry['text'] = text[:300]
+        if thinking:
+            entry['thinking'] = thinking
+        if tool_calls:
+            entry['tools'] = tool_calls
+        return entry
+
+    if role in ('toolresult', 'tool_result'):
+        details = msg.get('details') or {}
+        code = details.get('exitCode')
+        if code is None:
+            code = details.get('code', details.get('status'))
+        output = ''
+        for c in msg.get('content', []) or []:
+            if c.get('type') == 'text' and c.get('text'):
+                output = str(c.get('text', '')).strip()[:200]
+                break
+        if not output:
+            for key in ('output', 'stdout', 'stderr', 'message'):
+                val = details.get(key)
+                if isinstance(val, str) and val.strip():
+                    output = val.strip()[:200]
+                    break
+
+        entry = {
+            'at': ts,
+            'kind': 'tool_result',
+            'tool': msg.get('toolName', msg.get('name', '')),
+            'exitCode': code,
+            'output': output,
+        }
+        duration_ms = details.get('durationMs')
+        if isinstance(duration_ms, (int, float)):
+            entry['durationMs'] = int(duration_ms)
+        return entry
+
+    if role == 'user':
+        text = ''
+        for c in msg.get('content', []) or []:
+            if c.get('type') == 'text' and c.get('text'):
+                text = str(c.get('text', '')).strip()
+                break
+        if not text:
+            return None
+        return {'at': ts, 'kind': 'user', 'text': text[:200]}
+
+    return None
+
+
+def get_agent_activity(agent_id, limit=30, task_id=None):
+    """从 Agent 的 session jsonl 读取最近活动。
+    如果 task_id 不为空，只返回提及该 task_id 的相关条目。
+    """
+    sessions_dir = OCLAW_HOME / 'agents' / agent_id / 'sessions'
+    if not sessions_dir.exists():
+        return []
+
+    # 扫描所有 jsonl（按修改时间倒序），优先最新
+    jsonl_files = sorted(sessions_dir.glob('*.jsonl'), key=lambda f: f.stat().st_mtime, reverse=True)
+    if not jsonl_files:
+        return []
+
+    entries = []
+    # 如果需要按 task_id 过滤，可能需要扫描多个文件
+    files_to_scan = jsonl_files[:3] if task_id else jsonl_files[:1]
+
+    for session_file in files_to_scan:
+        try:
+            lines = session_file.read_text(errors='ignore').splitlines()
+        except Exception:
+            continue
+
+        # 正向扫描以保持时间顺序；如果有 task_id，收集提及 task_id 的条目
+        for ln in lines:
+            try:
+                item = json.loads(ln)
+            except Exception:
+                continue
+            msg = item.get('message') or {}
+            all_text = _collect_message_text(msg)
+
+            # task_id 过滤：只保留提及 task_id 的条目
+            if task_id and task_id not in all_text:
+                continue
+            entry = _parse_activity_entry(item)
+            if entry:
+                entries.append(entry)
+
+            if len(entries) >= limit:
+                break
+        if len(entries) >= limit:
+            break
+
+    # 只保留最后 limit 条
+    return entries[-limit:]
+
+
+def _extract_keywords(title):
+    """从任务标题中提取有意义的关键词（用于 session 内容匹配）。"""
+    stop = {'的', '了', '在', '是', '有', '和', '与', '或', '一个', '一篇', '关于', '进行',
+            '写', '做', '请', '把', '给', '用', '要', '需要', '面向', '风格', '包含',
+            '出', '个', '不', '可以', '应该', '如何', '怎么', '什么', '这个', '那个'}
+    # 提取英文词
+    en_words = re.findall(r'[a-zA-Z][\w.-]{1,}', title)
+    # 提取 2-4 字中文词组（更短的颗粒度）
+    cn_words = re.findall(r'[\u4e00-\u9fff]{2,4}', title)
+    all_words = en_words + cn_words
+    kws = [w for w in all_words if w not in stop and len(w) >= 2]
+    # 去重保序
+    seen = set()
+    unique = []
+    for w in kws:
+        if w.lower() not in seen:
+            seen.add(w.lower())
+            unique.append(w)
+    return unique[:8]  # 最多 8 个关键词
+
+
+def get_agent_activity_by_keywords(agent_id, keywords, limit=20):
+    """从 agent session 中按关键词匹配获取活动条目。
+    找到包含关键词的 session 文件，只读该文件的活动。
+    """
+    sessions_dir = OCLAW_HOME / 'agents' / agent_id / 'sessions'
+    if not sessions_dir.exists():
+        return []
+
+    jsonl_files = sorted(sessions_dir.glob('*.jsonl'), key=lambda f: f.stat().st_mtime, reverse=True)
+    if not jsonl_files:
+        return []
+
+    # 找到包含关键词的 session 文件
+    target_file = None
+    for sf in jsonl_files[:5]:
+        try:
+            content = sf.read_text(errors='ignore')
+        except Exception:
+            continue
+        hits = sum(1 for kw in keywords if kw.lower() in content.lower())
+        if hits >= min(2, len(keywords)):
+            target_file = sf
+            break
+
+    if not target_file:
+        return []
+
+    # 解析 session 文件，按 user 消息分割为对话段
+    # 找到包含关键词的对话段，只返回该段的活动
+    try:
+        lines = target_file.read_text(errors='ignore').splitlines()
+    except Exception:
+        return []
+
+    # 第一遍：找到关键词匹配的 user 消息位置
+    user_msg_indices = []  # (line_index, user_text)
+    for i, ln in enumerate(lines):
+        try:
+            item = json.loads(ln)
+        except Exception:
+            continue
+        msg = item.get('message') or {}
+        if msg.get('role') == 'user':
+            text = ''
+            for c in msg.get('content', []):
+                if c.get('type') == 'text' and c.get('text'):
+                    text += c['text']
+            user_msg_indices.append((i, text))
+
+    # 找到与关键词匹配度最高的 user 消息
+    best_idx = -1
+    best_hits = 0
+    for line_idx, utext in user_msg_indices:
+        hits = sum(1 for kw in keywords if kw.lower() in utext.lower())
+        if hits > best_hits:
+            best_hits = hits
+            best_idx = line_idx
+
+    # 确定对话段的行范围：从匹配的 user 消息到下一个 user 消息之前
+    if best_idx >= 0 and best_hits >= min(2, len(keywords)):
+        # 找下一个 user 消息的位置
+        next_user_idx = len(lines)
+        for line_idx, _ in user_msg_indices:
+            if line_idx > best_idx:
+                next_user_idx = line_idx
+                break
+        start_line = best_idx
+        end_line = next_user_idx
+    else:
+        # 没找到匹配的对话段，返回空
+        return []
+
+    # 第二遍：只解析对话段内的行
+    entries = []
+    for ln in lines[start_line:end_line]:
+        try:
+            item = json.loads(ln)
+        except Exception:
+            continue
+        entry = _parse_activity_entry(item)
+        if entry:
+            entries.append(entry)
+
+    return entries[-limit:]
+
+
+def get_agent_latest_segment(agent_id, limit=20):
+    """获取 Agent 最新一轮对话段（最后一条 user 消息起的所有内容）。
+    用于活跃任务没有精确匹配时，展示 Agent 的实时工作状态。
+    """
+    sessions_dir = OCLAW_HOME / 'agents' / agent_id / 'sessions'
+    if not sessions_dir.exists():
+        return []
+
+    jsonl_files = sorted(sessions_dir.glob('*.jsonl'),
+                         key=lambda f: f.stat().st_mtime, reverse=True)
+    if not jsonl_files:
+        return []
+
+    # 读取最新的 session 文件
+    target_file = jsonl_files[0]
+    try:
+        lines = target_file.read_text(errors='ignore').splitlines()
+    except Exception:
+        return []
+
+    # 找到最后一条 user 消息的行号
+    last_user_idx = -1
+    for i, ln in enumerate(lines):
+        try:
+            item = json.loads(ln)
+        except Exception:
+            continue
+        msg = item.get('message') or {}
+        if msg.get('role') == 'user':
+            last_user_idx = i
+
+    if last_user_idx < 0:
+        return []
+
+    # 从最后一条 user 消息开始，解析到文件末尾
+    entries = []
+    for ln in lines[last_user_idx:]:
+        try:
+            item = json.loads(ln)
+        except Exception:
+            continue
+        entry = _parse_activity_entry(item)
+        if entry:
+            entries.append(entry)
+
+    return entries[-limit:]
+
+
+def _compute_phase_durations(flow_log):
+    """从 flow_log 计算每个阶段的停留时长。"""
+    if not flow_log or len(flow_log) < 1:
+        return []
+    phases = []
+    for i, fl in enumerate(flow_log):
+        start_at = fl.get('at', '')
+        to_dept = fl.get('to', '')
+        remark = fl.get('remark', '')
+        # 下一阶段的起始时间就是本阶段的结束时间
+        if i + 1 < len(flow_log):
+            end_at = flow_log[i + 1].get('at', '')
+            ongoing = False
+        else:
+            end_at = now_iso()
+            ongoing = True
+        # 计算时长
+        dur_sec = 0
+        try:
+            from_dt = datetime.datetime.fromisoformat(start_at.replace('Z', '+00:00'))
+            to_dt = datetime.datetime.fromisoformat(end_at.replace('Z', '+00:00'))
+            dur_sec = max(0, int((to_dt - from_dt).total_seconds()))
+        except Exception:
+            pass
+        # 人类可读时长
+        if dur_sec < 60:
+            dur_text = f'{dur_sec}秒'
+        elif dur_sec < 3600:
+            dur_text = f'{dur_sec // 60}分{dur_sec % 60}秒'
+        elif dur_sec < 86400:
+            h, rem = divmod(dur_sec, 3600)
+            dur_text = f'{h}小时{rem // 60}分'
+        else:
+            d, rem = divmod(dur_sec, 86400)
+            dur_text = f'{d}天{rem // 3600}小时'
+        phases.append({
+            'phase': to_dept,
+            'from': start_at,
+            'to': end_at,
+            'durationSec': dur_sec,
+            'durationText': dur_text,
+            'ongoing': ongoing,
+            'remark': remark,
+        })
+    return phases
+
+
+def _compute_todos_summary(todos):
+    """计算 todos 完成率汇总。"""
+    if not todos:
+        return None
+    total = len(todos)
+    completed = sum(1 for t in todos if t.get('status') == 'completed')
+    in_progress = sum(1 for t in todos if t.get('status') == 'in-progress')
+    not_started = total - completed - in_progress
+    percent = round(completed / total * 100) if total else 0
+    return {
+        'total': total,
+        'completed': completed,
+        'inProgress': in_progress,
+        'notStarted': not_started,
+        'percent': percent,
+    }
+
+
+def _compute_todos_diff(prev_todos, curr_todos):
+    """计算两个 todos 快照之间的差异。"""
+    prev_map = {str(t.get('id', '')): t for t in (prev_todos or [])}
+    curr_map = {str(t.get('id', '')): t for t in (curr_todos or [])}
+    changed, added, removed = [], [], []
+    for tid, ct in curr_map.items():
+        if tid in prev_map:
+            pt = prev_map[tid]
+            if pt.get('status') != ct.get('status'):
+                changed.append({
+                    'id': tid, 'title': ct.get('title', ''),
+                    'from': pt.get('status', ''), 'to': ct.get('status', ''),
+                })
+        else:
+            added.append({'id': tid, 'title': ct.get('title', '')})
+    for tid, pt in prev_map.items():
+        if tid not in curr_map:
+            removed.append({'id': tid, 'title': pt.get('title', '')})
+    if not changed and not added and not removed:
+        return None
+    return {'changed': changed, 'added': added, 'removed': removed}
+
+
+def get_task_activity(task_id):
+    """获取任务的实时进展数据。
+    数据来源：
+    1. 任务自身的 now / todos / flow_log 字段（由 Agent 通过 progress 命令主动上报）
+    2. Agent session JSONL 中的对话日志（thinking / tool_result / user，用于展示思考过程）
+
+    增强字段:
+    - taskMeta: 任务元信息 (title/state/org/output/block/priority/reviewRound/archived)
+    - phaseDurations: 各阶段停留时长
+    - todosSummary: todos 完成率汇总
+    - resourceSummary: Agent 资源消耗汇总 (tokens/cost/elapsed)
+    - activity 条目中 progress/todos 保留 state/org 快照
+    - activity 中 todos 条目含 diff 字段
+    """
+    tasks = load_tasks()
+    task = next((t for t in tasks if t.get('id') == task_id), None)
+    if not task:
+        return {'ok': False, 'error': f'任务 {task_id} 不存在'}
+
+    state = task.get('state', '')
+    org = task.get('org', '')
+    now_text = task.get('now', '')
+    todos = task.get('todos', [])
+    updated_at = task.get('updatedAt', '')
+
+    # ── 任务元信息 ──
+    task_meta = {
+        'title': task.get('title', ''),
+        'state': state,
+        'org': org,
+        'output': task.get('output', ''),
+        'block': task.get('block', ''),
+        'priority': task.get('priority', 'normal'),
+        'reviewRound': task.get('review_round', 0),
+        'archived': task.get('archived', False),
+    }
+
+    # 当前负责 Agent（兼容旧逻辑）
+    agent_id = _STATE_AGENT_MAP.get(state)
+    if agent_id is None and state in ('Doing', 'Next'):
+        agent_id = _ORG_AGENT_MAP.get(org)
+
+    # ── 构建活动条目列表（flow_log + progress_log）──
+    activity = []
+    flow_log = task.get('flow_log', [])
+
+    # 1. flow_log 转为活动条目
+    for fl in flow_log:
+        activity.append({
+            'at': fl.get('at', ''),
+            'kind': 'flow',
+            'from': fl.get('from', ''),
+            'to': fl.get('to', ''),
+            'remark': fl.get('remark', ''),
+        })
+
+    progress_log = task.get('progress_log', [])
+    related_agents = set()
+
+    # 资源消耗累加
+    total_tokens = 0
+    total_cost = 0.0
+    total_elapsed = 0
+    has_resource_data = False
+
+    # 用于 todos diff 计算
+    prev_todos_snapshot = None
+
+    if progress_log:
+        # 2. 多 Agent 实时进展日志（每条 progress 都保留自己的 todo 快照）
+        for pl in progress_log:
+            p_at = pl.get('at', '')
+            p_agent = pl.get('agent', '')
+            p_text = pl.get('text', '')
+            p_todos = pl.get('todos', [])
+            p_state = pl.get('state', '')
+            p_org = pl.get('org', '')
+            if p_agent:
+                related_agents.add(p_agent)
+            # 累加资源消耗
+            if pl.get('tokens'):
+                total_tokens += pl['tokens']
+                has_resource_data = True
+            if pl.get('cost'):
+                total_cost += pl['cost']
+                has_resource_data = True
+            if pl.get('elapsed'):
+                total_elapsed += pl['elapsed']
+                has_resource_data = True
+            if p_text:
+                entry = {
+                    'at': p_at,
+                    'kind': 'progress',
+                    'text': p_text,
+                    'agent': p_agent,
+                    'agentLabel': pl.get('agentLabel', ''),
+                    'state': p_state,
+                    'org': p_org,
+                }
+                # 单条资源数据
+                if pl.get('tokens'):
+                    entry['tokens'] = pl['tokens']
+                if pl.get('cost'):
+                    entry['cost'] = pl['cost']
+                if pl.get('elapsed'):
+                    entry['elapsed'] = pl['elapsed']
+                activity.append(entry)
+            if p_todos:
+                todos_entry = {
+                    'at': p_at,
+                    'kind': 'todos',
+                    'items': p_todos,
+                    'agent': p_agent,
+                    'agentLabel': pl.get('agentLabel', ''),
+                    'state': p_state,
+                    'org': p_org,
+                }
+                # 计算 diff
+                diff = _compute_todos_diff(prev_todos_snapshot, p_todos)
+                if diff:
+                    todos_entry['diff'] = diff
+                activity.append(todos_entry)
+                prev_todos_snapshot = p_todos
+
+        # 仅当无法通过状态确定 Agent 时，才回退到最后一次上报的 Agent
+        if not agent_id:
+            last_pl = progress_log[-1]
+            if last_pl.get('agent'):
+                agent_id = last_pl.get('agent')
+    else:
+        # 兼容旧数据：仅使用 now/todos
+        if now_text:
+            activity.append({
+                'at': updated_at,
+                'kind': 'progress',
+                'text': now_text,
+                'agent': agent_id or '',
+                'state': state,
+                'org': org,
+            })
+        if todos:
+            activity.append({
+                'at': updated_at,
+                'kind': 'todos',
+                'items': todos,
+                'agent': agent_id or '',
+                'state': state,
+                'org': org,
+            })
+
+    # 按时间排序，保证流转/进展穿插正确
+    activity.sort(key=lambda x: x.get('at', ''))
+
+    if agent_id:
+        related_agents.add(agent_id)
+
+    # ── 融合 Agent Session 活动（thinking / tool_result / user）──
+    # 从 session JSONL 中提取 Agent 的思考过程和工具调用记录
+    try:
+        session_entries = []
+        # 活跃任务：尝试按 task_id 精确匹配
+        if state not in ('Done', 'Cancelled'):
+            if agent_id:
+                entries = get_agent_activity(agent_id, limit=30, task_id=task_id)
+                session_entries.extend(entries)
+            # 也从其他相关 Agent 获取
+            for ra in related_agents:
+                if ra != agent_id:
+                    entries = get_agent_activity(ra, limit=20, task_id=task_id)
+                    session_entries.extend(entries)
+        else:
+            # 已完成任务：基于关键词匹配
+            title = task.get('title', '')
+            keywords = _extract_keywords(title)
+            if keywords:
+                agents_to_scan = list(related_agents) if related_agents else ([agent_id] if agent_id else [])
+                for ra in agents_to_scan[:5]:
+                    entries = get_agent_activity_by_keywords(ra, keywords, limit=15)
+                    session_entries.extend(entries)
+        # 去重（通过 at+kind 去重避免重复）
+        existing_keys = {(a.get('at', ''), a.get('kind', '')) for a in activity}
+        for se in session_entries:
+            key = (se.get('at', ''), se.get('kind', ''))
+            if key not in existing_keys:
+                activity.append(se)
+                existing_keys.add(key)
+        # 重新排序
+        activity.sort(key=lambda x: x.get('at', ''))
+    except Exception as e:
+        log.warning(f'Session JSONL 融合失败 (task={task_id}): {e}')
+
+    # ── 阶段耗时统计 ──
+    phase_durations = _compute_phase_durations(flow_log)
+
+    # ── Todos 汇总 ──
+    todos_summary = _compute_todos_summary(todos)
+
+    # ── 总耗时（首条 flow_log 到最后一条/当前） ──
+    total_duration = None
+    if flow_log:
+        try:
+            first_at = datetime.datetime.fromisoformat(flow_log[0].get('at', '').replace('Z', '+00:00'))
+            if state in ('Done', 'Cancelled') and len(flow_log) >= 2:
+                last_at = datetime.datetime.fromisoformat(flow_log[-1].get('at', '').replace('Z', '+00:00'))
+            else:
+                last_at = datetime.datetime.now(datetime.timezone.utc)
+            dur = max(0, int((last_at - first_at).total_seconds()))
+            if dur < 60:
+                total_duration = f'{dur}秒'
+            elif dur < 3600:
+                total_duration = f'{dur // 60}分{dur % 60}秒'
+            elif dur < 86400:
+                h, rem = divmod(dur, 3600)
+                total_duration = f'{h}小时{rem // 60}分'
+            else:
+                d, rem = divmod(dur, 86400)
+                total_duration = f'{d}天{rem // 3600}小时'
+        except Exception:
+            pass
+
+    last_active = None
+    if updated_at:
+        try:
+            dt = _parse_iso(updated_at)
+            if dt:
+                last_active = dt.astimezone().strftime('%Y-%m-%d %H:%M:%S')
+            else:
+                last_active = updated_at[:19].replace('T', ' ')
+        except Exception:
+            last_active = updated_at[:19].replace('T', ' ')
+
+    result = {
+        'ok': True,
+        'taskId': task_id,
+        'taskMeta': task_meta,
+        'agentId': agent_id,
+        'agentLabel': _STATE_LABELS.get(state, state),
+        'lastActive': last_active,
+        'activity': activity,
+        'activitySource': 'progress+session',
+        'relatedAgents': sorted(list(related_agents)),
+        'phaseDurations': phase_durations,
+        'totalDuration': total_duration,
+    }
+    if todos_summary:
+        result['todosSummary'] = todos_summary
+    if has_resource_data:
+        result['resourceSummary'] = {
+            'totalTokens': total_tokens,
+            'totalCost': round(total_cost, 4),
+            'totalElapsedSec': total_elapsed,
+        }
+    return result
+
+
+# 状态推进顺序（手动推进用）
+_STATE_FLOW = {
+    'Pending':  ('Taizi', '老板', '总办', '待处理任务转交总办分拣'),
+    'Taizi':    ('Zhongshu', '总办', '规划部', '总办分拣完毕，转规划部起草'),
+    'Zhongshu': ('Menxia', '规划部', '审议部', '规划部方案提交审议部审议'),
+    'Menxia':   ('Assigned', '审议部', '执行办', '审议部通过，转执行办派发'),
+    'Assigned': ('Doing', '执行办', '执行部门', '执行办开始派发执行'),
+    'Next':     ('Doing', '执行办', '执行部门', '待执行任务开始执行'),
+    'Doing':    ('Review', '执行部门', '执行办', '各部门完成，进入汇总'),
+    'Review':   ('Done', '执行办', '总办', '全流程完成，汇总至总办报老板确认'),
+}
+_STATE_LABELS = {
+    'Pending': '待处理', 'Taizi': '总办', 'Zhongshu': '规划部', 'Menxia': '审议部',
+    'Assigned': '执行办', 'Next': '待执行', 'Doing': '执行中', 'Review': '审查', 'Done': '完成',
+}
+
+
+# ── 共享知识底座 ────────────────────────────────────────────
+SHARED_KNOWLEDGE_DIR = OCLAW_HOME / 'workspace-main' / 'shared-knowledge'
+
+# 任务类型 → 共享知识关键词映射（用于匹配 relevant knowledge）
+_KNOWLEDGE_KEYWORDS = {
+    '生图': ['图', 'image', 'gemini', '提示词', 'prompt', 'zonal', '视觉', '设计', 'display', '海报', '画册', 'photo', 'render'],
+    '翻译': ['翻译', 'i18n', '多语言', '文案', 'locale', '语种', 'copywriting', 'localization'],
+    '前端': ['css', 'html', '样式', '布局', '组件', '前端', 'frontend', 'UI', 'responsive', 'tailwind', '页面'],
+    '代码': ['代码', '开发', '重构', 'bug', '修复', '函数', 'api', '接口', 'coding', 'refactor', '脚本'],
+    '审查': ['审查', 'review', '质量', '测试', '验收', 'lint', '检查', '审议'],
+    '部署': ['部署', 'deploy', 'ci', 'cd', '服务器', '运维', 'server', 'docker', '上线'],
+}
+
+
+def _build_knowledge_context(task_title='', task_org='', task_project=''):
+    """从 shared-knowledge/ 中提取与当前任务相关的经验，返回注入文本。"""
+    idx_path = SHARED_KNOWLEDGE_DIR / 'INDEX.md'
+    if not idx_path.exists():
+        return ''
+    try:
+        idx_text = idx_path.read_text(encoding='utf-8')
+    except Exception:
+        return ''
+
+    # 确定任务类型
+    task_type = None
+    combined = f'{task_title} {task_org} {task_project}'.lower()
+    for ttype, keywords in _KNOWLEDGE_KEYWORDS.items():
+        if any(kw in combined for kw in keywords):
+            task_type = ttype
+            break
+
+    # 收集相关条目
+    relevant = []
+    for cat_dir, cat_label in [('lessons', '踩过的坑'), ('methods', '方法论'), ('preferences', '老板偏好')]:
+        cat_path = SHARED_KNOWLEDGE_DIR / cat_dir
+        if not cat_path.is_dir():
+            continue
+        for entry_file in sorted(cat_path.glob('*.md')):
+            try:
+                # 读标题和首段
+                lines = entry_file.read_text(encoding='utf-8').splitlines()
+                title = ''
+                summary = ''
+                in_summary = False
+                for line in lines:
+                    stripped = line.strip()
+                    if stripped.startswith('# ') and not title:
+                        title = stripped[2:].strip()
+                    elif stripped and not stripped.startswith('#') and not stripped.startswith('>'):
+                        if not summary:
+                            summary = stripped[:120]
+                        break
+                # 关键词匹配
+                entry_text = f'{title} {summary}'.lower()
+                if task_type:
+                    keywords = _KNOWLEDGE_KEYWORDS.get(task_type, [])
+                    if any(kw in entry_text for kw in keywords):
+                        relevant.append((cat_label, title, summary[:100]))
+            except Exception:
+                continue
+
+    # 如果无匹配，注入通用反模式提醒
+    if not relevant:
+        # 检查是否有通用编码反模式（对所有任务适用）
+        ant_pattern = SHARED_KNOWLEDGE_DIR / 'lessons' / '2026-05-21-llm-coding-anti-patterns.md'
+        if ant_pattern.exists():
+            relevant.append(('踩过的坑', 'LLM编码反模式', '静默假设/过度工程/链式幻觉/盲目重试/投机代码'))
+
+    if not relevant:
+        return ''
+
+    lines = ['', '📚 **共享知识（前人经验，请务必注意）**']
+    for cat, title, summary in relevant[:3]:  # 最多 3 条
+        lines.append(f'  • [{cat}] {title}')
+        if summary:
+            lines.append(f'    {summary}')
+
+    return '\n'.join(lines)
+
+
+def _build_cdd_context(task):
+    """构建 CDD 协作约束注入文本（六合一 v2）。
+
+    从 task['cdd']（军师写的协作契约框架）提取涉及 Agent、接口契约、
+    对齐规则，注入给派发接收方，保证多 Agent 干同一任务时信息统一。
+    返回 (text, involved_agents)：text 为注入文本，involved_agents 为
+    该任务涉及的所有 Agent id 列表。
+    """
+    cdd = task.get('cdd')
+    if not isinstance(cdd, dict):
+        return '', []
+
+    lines = ['', '🤝 **CDD 协作契约（多 Agent 信息统一，务必遵守）**']
+    involved = []
+
+    agents = cdd.get('agents')
+    if isinstance(agents, list) and agents:
+        lines.append('涉及协作方：')
+        for a in agents:
+            name = a.get('role') or a.get('agent') or ''
+            dels = a.get('deliverables')
+            if a.get('agent'):
+                involved.append(a['agent'])
+            del_txt = ('：' + '、'.join(dels)) if isinstance(dels, list) and dels else ''
+            lines.append(f'  • {name}{del_txt}')
+
+    interfaces = cdd.get('interfaces')
+    if isinstance(interfaces, list) and interfaces:
+        lines.append('接口/交接契约：')
+        for itf in interfaces[:8]:
+            frm = itf.get('from', '')
+            to = itf.get('to', '')
+            contract = itf.get('contract', '')
+            must = itf.get('must_match', '')
+            seg = f'{frm}→{to}: {contract}'
+            if must:
+                seg += f'（{must}）'
+            lines.append(f'  • {seg}')
+
+    rules = cdd.get('alignment_rules')
+    if isinstance(rules, list) and rules:
+        lines.append('对齐规则：')
+        for r in rules[:8]:
+            lines.append(f'  • {r}')
+
+    return '\n'.join(lines), involved
+
+
+def _build_sdd_context(task):
+    """构建 SDD 契约摘要注入文本（六合一 v2）。
+
+    从 task['spec'] 提取 purpose/outputs/acceptance_criteria/boundaries，
+    注入派发消息，让接收 Agent 明确验收标准（防跑偏）。
+    """
+    spec = task.get('spec')
+    if not isinstance(spec, dict):
+        return ''
+
+    lines = ['', '📐 **SDD 契约（验收标准，输出必须对齐）**']
+    if spec.get('purpose'):
+        lines.append(f'目标：{spec["purpose"]}')
+    outs = spec.get('outputs')
+    if isinstance(outs, list) and outs:
+        lines.append('交付物：' + '、'.join(outs[:6]))
+    ac = spec.get('acceptance_criteria')
+    if isinstance(ac, list) and ac:
+        lines.append('验收标准：')
+        for i, c in enumerate(ac[:6], 1):
+            lines.append(f'  {i}. {c}')
+    bounds = spec.get('boundaries')
+    if isinstance(bounds, list) and bounds:
+        lines.append('范围边界（不做）：' + '、'.join(bounds[:5]))
+
+    return '\n'.join(lines)
+
+
+def _build_post_done_review_prompt(task_title='', task_org=''):
+    """生成任务完成后的经验回顾提示。"""
+    return (
+        f'\n\n🧠 **任务完成 — 请执行进化回顾**\n'
+        f'回顾刚才的工作，用 kanban_update.py 写入经验：\n'
+        f'  1. 踩了坑？→ python3 scripts/kanban_update.py memory <agent_id> lesson "坑描述"\n'
+        f'  2. 发现了高效方法？→ python3 scripts/kanban_update.py memory <agent_id> method "方法描述"\n'
+        f'  3. 有关键决策需要传给下一个任务？→ python3 scripts/kanban_update.py task-memo <task_id> <agent_id> "决策1,决策2"\n'
+        f'  4. 规则需要全员遵守？→ python3 scripts/kanban_update.py shared-memo "规则内容" <agent_id>\n'
+        f'（可跳过：如果这次任务没有值得记录的经验）'
+    )
+
+
+# ── 部门 → 推荐技能映射（技能全局共用后，指引 Agent 接到任务时用上对应技能）──
+# org 为部门现代名/古名，agent_id 为子 Agent id；标题匹配用于销售/B2B 类任务
+_DEPT_SKILLS = {
+    # real Agent id（registry.json）→ 推荐技能
+    'daima':   ['github', 'sdd-writer', 'ai-project-docs'],
+    'wenan':   ['b2b-client-development', 'b2b-sales-methodology', 'ai-brochure-generation'],
+    'sheji':   ['ai-brochure-generation', 'image-generation'],
+    'shenyi':  ['mll-review', 'receiving-code-review'],
+    'shencha': ['mll-review', 'skill-distiller'],
+    'guihua':  ['sdd-writer', 'ai-project-docs', 'writing-plans'],
+    'paifa':   ['dispatching-parallel-agents', 'multi-agent-cn'],
+    'huizong': ['finishing-a-development-branch'],
+    'rongcui': ['healthcheck'],
+    'ld-r':    ['executing-plans', 'writing-plans'],
+    # 部门角色 id（dispatch_for_state 派发实际用的 _ORG_AGENT_MAP 值）→ 推荐技能
+    'bingbu':    ['github', 'sdd-writer', 'ai-project-docs'],
+    'gongbu':    ['ai-brochure-generation', 'image-generation'],
+    'libu':      ['b2b-client-development', 'b2b-sales-methodology', 'ai-brochure-generation'],
+    'libu_hr':   ['dispatching-parallel-agents', 'multi-agent-cn'],
+    'hubu':      ['finishing-a-development-branch'],
+    'xingbu':    ['mll-review', 'skill-distiller'],
+    'zhongshu':  ['sdd-writer', 'ai-project-docs', 'writing-plans'],
+    'menxia':    ['mll-review', 'receiving-code-review'],
+    'shangshu':  ['executing-plans', 'writing-plans'],
+    'zaochao':   ['healthcheck'],
+    # org 部门现代名/古名 → 推荐技能
+    '开发部':   ['github', 'sdd-writer', 'ai-project-docs'],
+    '兵部':     ['github', 'sdd-writer', 'ai-project-docs'],
+    '内容部':   ['b2b-client-development', 'b2b-sales-methodology', 'ai-brochure-generation'],
+    '礼部':     ['b2b-client-development', 'b2b-sales-methodology', 'ai-brochure-generation'],
+    '设计部':   ['ai-brochure-generation', 'image-generation'],
+    '工部':     ['ai-brochure-generation', 'image-generation'],
+    '审议部':   ['mll-review', 'receiving-code-review'],
+    '门下省':   ['mll-review', 'receiving-code-review'],
+    '质控部':   ['mll-review', 'skill-distiller'],
+    '刑部':     ['mll-review', 'skill-distiller'],
+    '规划部':   ['sdd-writer', 'ai-project-docs', 'writing-plans'],
+    '中书省':   ['sdd-writer', 'ai-project-docs', 'writing-plans'],
+    '人力路由处': ['dispatching-parallel-agents', 'multi-agent-cn'],
+    '吏部':     ['dispatching-parallel-agents', 'multi-agent-cn'],
+    '交付汇总处': ['finishing-a-development-branch'],
+    '户部':     ['finishing-a-development-branch'],
+    '运维组':   ['healthcheck'],
+    '钦天监':   ['healthcheck'],
+    '执行办':   ['executing-plans', 'writing-plans'],
+    '尚书省':   ['executing-plans', 'writing-plans'],
+}
+# 标题关键词 → 推荐技能（销售/B2B/贸易/商务类任务）
+_TITLE_SKILL_KEYWORDS = [
+    (['b2b', 'sale', '销售', '商务', '客户', '谈判'], ['b2b-sales-negotiation', 'b2b-sales-methodology']),
+    (['trade', '贸易', '跟单', '订单', '进出口'], ['b2b-trade-tools', 'b2b-trade-workflow']),
+    (['brochure', '宣传册', '画册', '产品手册'], ['ai-brochure-generation']),
+    (['文档', '架构', '方案'], ['ai-project-docs', 'sdd-writer']),
+]
+
+
+def _build_skill_guidance(agent_id='', task_org='', task_title=''):
+    """根据部门/Agent/任务标题生成『推荐技能』提示，注入派发消息，确保 Agent 用上对应技能。
+    技能已在全局池（openclaw-managed）对所有 Agent 共用，此处仅做任务时引导。"""
+    skills = []
+    # 1. 先按 agent_id / org 精确匹配
+    for key in (agent_id, task_org):
+        if key in _DEPT_SKILLS:
+            skills.extend(_DEPT_SKILLS[key])
+    # 2. 再按标题关键词匹配（销售/贸易/文档类任务）
+    if not skills:
+        combined = f'{task_title} {task_org}'.lower()
+        for kws, sk_list in _TITLE_SKILL_KEYWORDS:
+            if any(kw in combined for kw in kws):
+                skills.extend(sk_list)
+                break
+    # 3. 去重保序
+    seen = set()
+    uniq = []
+    for s in skills:
+        if s not in seen:
+            seen.add(s)
+            uniq.append(s)
+    if not uniq:
+        return ''
+    names = '、'.join(f'`{s}`' for s in uniq)
+    return (f'\n🧠 **本任务推荐技能（全局共用，请优先使用）**：{names}\n'
+            f'      这些技能已在系统全局可用，处理本任务时请主动读取并调用对应 SKILL.md，避免凭直觉硬做。')
+
+
+def dispatch_for_state(task_id, task, new_state, trigger='state-transition'):
+    """推进/审批后自动派发对应 Agent（后台异步，不阻塞响应）。"""
+    agent_id = _STATE_AGENT_MAP.get(new_state)
+    if agent_id is None and new_state in ('Doing', 'Next'):
+        org = task.get('org', '')
+        agent_id = _ORG_AGENT_MAP.get(org)
+    if not agent_id:
+        log.info(f'ℹ️ {task_id} 新状态 {new_state} 无对应 Agent，跳过自动派发')
+        return
+
+    _update_task_scheduler(task_id, lambda t, s: (
+        s.update({
+            'lastDispatchAt': now_iso(),
+            'lastDispatchStatus': 'queued',
+            'lastDispatchAgent': agent_id,
+            'lastDispatchTrigger': trigger,
+        }),
+        _scheduler_add_flow(t, f'已入队派发：{new_state} → {agent_id}（{trigger}）', to=_STATE_LABELS.get(new_state, new_state))
+    ))
+
+    title = task.get('title', '(无标题)')
+    target_dept = task.get('targetDept', '')
+
+    # 根据 agent_id 构造针对性消息
+    _msgs = {
+        'taizi': (
+            f'📜 老板下达任务需要你处理\n'
+            f'任务ID: {task_id}\n'
+            f'任务: {title}\n'
+            f'⚠️ 看板已有此任务，请勿重复创建。直接用 kanban_update.py 更新状态。\n'
+            f'请立即转交规划部起草执行方案。'
+        ),
+        'zhongshu': (
+            f'📜 任务已到规划部，请起草方案\n'
+            f'任务ID: {task_id}\n'
+            f'任务: {title}\n'
+            f'⚠️ 看板已有此任务记录，请勿重复创建。直接用 kanban_update.py state 更新状态。\n'
+            f'请立即起草执行方案，走完完整流程（规划起草→审议审议→执行派发→部门执行）。'
+        ),
+        'menxia': (
+            f'📋 规划部方案提交审议\n'
+            f'任务ID: {task_id}\n'
+            f'任务: {title}\n'
+            f'⚠️ 看板已有此任务，请勿重复创建。\n'
+            f'请审议规划部方案，给出通过或驳回意见。'
+        ),
+        'shangshu': (
+            f'📮 审议部已通过，请派发执行\n'
+            f'任务ID: {task_id}\n'
+            f'任务: {title}\n'
+            f'{"建议派发部门: " + target_dept if target_dept else ""}\n'
+            f'⚠️ 看板已有此任务，请勿重复创建。\n'
+            f'请分析方案并派发给执行部门。'
+        ),
+    }
+    msg = _msgs.get(agent_id, (
+        f'📌 请处理任务\n'
+        f'任务ID: {task_id}\n'
+        f'任务: {title}\n'
+        f'⚠️ 看板已有此任务，请勿重复创建。直接用 kanban_update.py 更新状态。'
+    ))
+
+    # 🔥 注入共享知识
+    knowledge = _build_knowledge_context(
+        task_title=title,
+        task_org=task.get('org', ''),
+        task_project=task.get('project', ''),
+    )
+    if knowledge:
+        msg += '\n' + knowledge
+    # 🔥 注入推荐技能引导（确保 Agent 接到任务时用上对应技能）
+    skill_guidance = _build_skill_guidance(
+        agent_id=agent_id,
+        task_org=task.get('org', ''),
+        task_title=title,
+    )
+    if skill_guidance:
+        msg += '\n' + skill_guidance
+    # 🔥 六合一 v2：注入 SDD 契约摘要 + CDD 协作约束（防跑偏 + 多 Agent 对齐）
+    # 提前解析真实 OpenClaw agent id，供 CDD 注入留痕记录实际接收方（可观测）
+    real_agent_id = _role_to_agent(agent_id)
+    sdd_txt = _build_sdd_context(task)
+    if sdd_txt:
+        msg += sdd_txt
+        if _SIX_UNITY_AVAILABLE and six_unity is not None:
+            try:
+                _update_task_scheduler(task_id, lambda t, s: (
+                    six_unity.cdd_record_injection(
+                        t, layer='S', knowledge_src='sdd-contract',
+                        agent=real_agent_id,
+                    ),
+                    None,
+                ))
+            except Exception as e:
+                log.warning(f'CDD(SDD) 注入留痕失败: {e}')
+    cdd_txt, cdd_agents = _build_cdd_context(task)
+    if cdd_txt:
+        msg += cdd_txt
+        if _SIX_UNITY_AVAILABLE and six_unity is not None:
+            try:
+                _update_task_scheduler(task_id, lambda t, s: (
+                    six_unity.cdd_record_injection(
+                        t, layer='C', knowledge_src='cdd-collab',
+                        agent=real_agent_id,
+                    ),
+                    None,
+                ))
+            except Exception as e:
+                log.warning(f'CDD(协作) 注入留痕失败: {e}')
+    # 🔥 CDD 注入留痕（可观测，最终版：汇总所有注入源）
+    if _SIX_UNITY_AVAILABLE and six_unity is not None:
+        try:
+            _srcs = []
+            if knowledge:
+                _srcs.append('shared-knowledge')
+            if skill_guidance:
+                _srcs.append('skill-guidance')
+            if sdd_txt:
+                _srcs.append('sdd-contract')
+            if cdd_txt:
+                _srcs.append('cdd-collab')
+            _final_src = ' + '.join(_srcs) if _srcs else 'none'
+            _update_task_scheduler(task_id, lambda t, s: (
+                six_unity.cdd_record_injection(
+                    t, layer='C', knowledge_src=_final_src,
+                    agent=real_agent_id,
+                ),
+                None,
+            ))
+        except Exception as e:
+            log.warning(f"CDD 注入留痕失败: {e}")
+
+    # 六部执行 Agent 追加: 任务完成后写经验
+    if agent_id in ('libu', 'hubu', 'bingbu', 'xingbu', 'gongbu', 'libu_hr'):
+        msg += _build_post_done_review_prompt(title, task.get('org', ''))
+
+    # 角色 ID → 实际 Agent ID 翻译（三省六部 → OpenClaw）
+    # real_agent_id 已在 CDD 注入留痕处提前解析；此处复用并切换 agent_id
+    if real_agent_id != agent_id:
+        log.info(f'🔀 dispatch 角色翻译: {agent_id} → {real_agent_id}')
+        agent_id = real_agent_id
+
+    def _do_dispatch():
+        try:
+            # Gateway 可能暂时不可达（休眠恢复、进程重启），等待后重试
+            import time as _time
+            _gw_alive = False
+            for _gw_attempt in range(3):
+                if _check_gateway_alive():
+                    _gw_alive = True
+                    break
+                if _gw_attempt < 2:
+                    _time.sleep(5 * (_gw_attempt + 1))  # 5s, 10s
+            if not _gw_alive:
+                log.warning(f'⚠️ {task_id} 自动派发跳过: Gateway 未启动（重试3次仍不可达）')
+                _update_task_scheduler(task_id, lambda t, s: s.update({
+                    'lastDispatchAt': now_iso(),
+                    'lastDispatchStatus': 'gateway-offline',
+                    'lastDispatchAgent': agent_id,
+                    'lastDispatchTrigger': trigger,
+                }))
+                return
+            # Fix #139/#182: dispatch channel 可配置；未配置时不传 --deliver 避免
+            # "unknown channel: feishu" 错误（非飞书用户）
+            _agent_cfg = read_json(DATA / 'agent_config.json', {})
+            _channel = (_agent_cfg.get('dispatchChannel') or '').strip()
+            openclaw_bin = _resolve_openclaw_bin()
+            if not openclaw_bin:
+                err = 'OpenClaw CLI 未找到：请确认已安装 openclaw 并加入 PATH；Windows 可设置 OPENCLAW_BIN 指向 openclaw.cmd'
+                log.warning(f'⚠️ {task_id} 自动派发异常: {err}')
+                _update_task_scheduler(task_id, lambda t, s: (
+                    s.update({
+                        'lastDispatchAt': now_iso(),
+                        'lastDispatchStatus': 'openclaw-missing',
+                        'lastDispatchAgent': agent_id,
+                        'lastDispatchTrigger': trigger,
+                        'lastDispatchError': err,
+                    }),
+                    _scheduler_add_flow(t, f'派发异常：OpenClaw CLI 未找到（{trigger}）', to=t.get('org', ''))
+                ))
+                return
+            # ⚡ 总办（main）已在当前session运行中，直接在当前会话通知
+            if agent_id == 'main':
+                log.info(f'ℹ️ {task_id} 总办已在当前session，直接发送通知消息')
+                _update_task_scheduler(task_id, lambda t, s: (
+                    s.update({
+                        'lastDispatchAt': now_iso(),
+                        'lastDispatchStatus': 'notify-main',
+                        'lastDispatchAgent': agent_id,
+                        'lastDispatchTrigger': trigger,
+                        'lastDispatchError': '',
+                    }),
+                    _scheduler_add_flow(t, f'通知总办（当前session）', to=t.get('org', ''))
+                ))
+                # 不跳过，直接发送消息到 main session（通过 --deliver 回当前对话）
+                cmd = [openclaw_bin, 'agent', '--agent', 'main', '-m', msg, '--deliver', '--timeout', str(DISPATCH_AGENT_TIMEOUT)]
+                log.info(f'🔄 通知总办 {task_id}（当前session投递）...')
+                try:
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                    import time as _time
+                    for _check in range(6):
+                        _ret = proc.poll()
+                        if _ret is not None:
+                            if _ret == 0:
+                                log.info(f'✅ {task_id} 总办通知完成')
+                            else:
+                                log.warning(f'⚠️ {task_id} 总办通知进程提前退出 code={_ret}')
+                            break
+                        _time.sleep(1)
+                except Exception as e:
+                    log.warning(f'⚠️ {task_id} 总办通知异常: {e}')
+                return
+
+            cmd = [openclaw_bin, 'agent', '--agent', agent_id, '-m', msg, '--timeout', str(DISPATCH_AGENT_TIMEOUT)]
+            if _channel:
+                cmd.extend(['--deliver', '--channel', _channel])
+            log.info(f'🔄 自动派发 {task_id} → {agent_id} (异步投递)...')
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                # 异步投递模式：不等待agent完成，仅确认进程启动
+                # Agent收到消息后会在自己的session中工作
+                import time as _time
+                for _check in range(6):
+                    _ret = proc.poll()
+                    if _ret is not None:
+                        if _ret == 0:
+                            log.info(f'✅ {task_id} 自动派发完成（同步返回） → {agent_id}')
+                        else:
+                            log.warning(f'⚠️ {task_id} 派发进程提前退出 code={_ret}')
+                        break
+                    _time.sleep(1)
+                else:
+                    # 进程仍在运行 = agent正在处理 = 投递成功
+                    log.info(f'✅ {task_id} 自动派发已投递（agent处理中） → {agent_id}')
+
+                # 注册清理回调，避免僵尸进程
+                # ⚡ 修复：缩短清理超时，避免 8 次 TimeoutExpired 堆叠
+                def _cleanup_proc(p=proc, tid=task_id, aid=agent_id, trig=trigger):
+                    try:
+                        p.wait(timeout=DISPATCH_CLEANUP_TIMEOUT)
+                    except subprocess.TimeoutExpired:
+                        log.warning(f'⚠️ {tid} 派发清理超时({DISPATCH_CLEANUP_TIMEOUT}s)，强制终止 → {aid}')
+                        p.kill()
+                        p.wait(timeout=5)
+                    _rc = p.returncode
+                    if _rc == 0:
+                        log.info(f'✅ {tid} 派发进程正常结束 → {aid}')
+                    elif _rc is not None:
+                        log.warning(f'⚠️ {tid} 派发进程退出 code={_rc} → {aid}')
+                        _update_task_scheduler(tid, lambda t, s: s.update({
+                            'lastDispatchError': f'进程退出 code={_rc}',
+                        }))
+
+                threading.Thread(target=_cleanup_proc, daemon=True).start()
+
+                _update_task_scheduler(task_id, lambda t, s: (
+                    s.update({
+                        'lastDispatchAt': now_iso(),
+                        'lastDispatchStatus': 'dispatched',
+                        'lastDispatchAgent': agent_id,
+                        'lastDispatchTrigger': trigger,
+                        'lastDispatchError': '',
+                    }),
+                    _scheduler_add_flow(t, f'异步投递成功：{agent_id}（{trigger}）', to=t.get('org', ''))
+                ))
+                return
+            except Exception as _e:
+                err = str(_e)[:200]
+                log.error(f'❌ {task_id} 自动派发异常 → {agent_id}: {err}')
+            _update_task_scheduler(task_id, lambda t, s: (
+                s.update({
+                    'lastDispatchAt': now_iso(),
+                    'lastDispatchStatus': 'failed',
+                    'lastDispatchAgent': agent_id,
+                    'lastDispatchTrigger': trigger,
+                    'lastDispatchError': err,
+                }),
+                _scheduler_add_flow(t, f'派发失败：{agent_id}（{trigger}）', to=t.get('org', ''))
+            ))
+        except subprocess.TimeoutExpired:
+            log.error(f'❌ {task_id} 自动派发超时 → {agent_id}')
+            _update_task_scheduler(task_id, lambda t, s: (
+                s.update({
+                    'lastDispatchAt': now_iso(),
+                    'lastDispatchStatus': 'timeout',
+                    'lastDispatchAgent': agent_id,
+                    'lastDispatchTrigger': trigger,
+                    'lastDispatchError': 'timeout',
+                }),
+                _scheduler_add_flow(t, f'派发超时：{agent_id}（{trigger}）', to=t.get('org', ''))
+            ))
+        except FileNotFoundError as e:
+            err = f'OpenClaw CLI 未找到：{e}'
+            log.warning(f'⚠️ {task_id} 自动派发异常: {err}')
+            _update_task_scheduler(task_id, lambda t, s: (
+                s.update({
+                    'lastDispatchAt': now_iso(),
+                    'lastDispatchStatus': 'openclaw-missing',
+                    'lastDispatchAgent': agent_id,
+                    'lastDispatchTrigger': trigger,
+                    'lastDispatchError': err[:200],
+                }),
+                _scheduler_add_flow(t, f'派发异常：OpenClaw CLI 未找到（{trigger}）', to=t.get('org', ''))
+            ))
+        except Exception as e:
+            log.warning(f'⚠️ {task_id} 自动派发异常: {e}')
+            _update_task_scheduler(task_id, lambda t, s: (
+                s.update({
+                    'lastDispatchAt': now_iso(),
+                    'lastDispatchStatus': 'error',
+                    'lastDispatchAgent': agent_id,
+                    'lastDispatchTrigger': trigger,
+                    'lastDispatchError': str(e)[:200],
+                }),
+                _scheduler_add_flow(t, f'派发异常：{agent_id}（{trigger}）', to=t.get('org', ''))
+            ))
+
+    threading.Thread(target=_do_dispatch, daemon=True).start()
+    log.info(f'🚀 {task_id} 推进后自动派发 → {agent_id}')
+
+
+def _build_six_unity_report():
+    """六合一可观测审计：统计各柱子留痕，证明'真的触发了'。"""
+    tasks = load_tasks()
+    total = len(tasks)
+    report = {
+        'enabled': _SIX_UNITY_AVAILABLE and six_unity is not None,
+        'hook_loaded': _SIX_UNITY_AVAILABLE and six_unity is not None,
+        'sdd_enforce': (six_unity.enabled() if six_unity else False),
+        'total_tasks': total,
+        'pillars': {
+            'SDD契约': {'spec_present': 0, 'spec_reviewed': 0, 'spec_blocked': 0},
+            'CDD注入': {'injected': 0},
+            '任务分解': {'audited': 0, 'passed': 0, 'blocked': 0},
+            'ORC审查': {'triggered': 0},
+            'SE经验': {'cards': 0},
+        },
+        'iterate': {'attempted': 0, 'ready': 0, 'stalled': 0, 'below_threshold': 0},
+        'experience_cards_file': str(DATA / 'experience-cards.jsonl'),
+    }
+    for t in tasks:
+        if t.get('spec'):
+            report['pillars']['SDD契约']['spec_present'] += 1
+            status = t.get('spec_status')
+            if status == 'reviewed':
+                report['pillars']['SDD契约']['spec_reviewed'] += 1
+            elif status == 'blocked':
+                report['pillars']['SDD契约']['spec_blocked'] += 1
+        if t.get('cdd_injected'):
+            report['pillars']['CDD注入']['injected'] += 1
+        da = t.get('decomp_audit')
+        if da:
+            report['pillars']['任务分解']['audited'] += 1
+            if da.get('verdict') == 'pass':
+                report['pillars']['任务分解']['passed'] += 1
+            else:
+                report['pillars']['任务分解']['blocked'] += 1
+        # 迭代(iterate) 可观测：轮次/分数/停滞
+        _it = (t.get('decomp_audit') or {}).get('iterate')
+        if _it:
+            report['iterate']['attempted'] += 1
+            if _it.get('stalled'):
+                report['iterate']['stalled'] += 1
+            elif _it.get('ready'):
+                report['iterate']['ready'] += 1
+            else:
+                report['iterate']['below_threshold'] += 1
+        if t.get('ocr_auto'):
+            report['pillars']['ORC审查']['triggered'] += 1
+    # SE 经验卡计数（读 jsonl）
+    try:
+        ef = DATA / 'experience-cards.jsonl'
+        if ef.exists():
+            report['pillars']['SE经验']['cards'] = sum(1 for _ in ef.open(encoding='utf-8'))
+    except Exception:
+        pass
+    return report
+
+
+# ── OCR 异步审查（锁卡死治本）──────────────────────────────────
+# 背景：原实现把 OCR 审查放到 _do_advance 持锁回调里同步执行，
+# OCR 慢/卡→排他文件锁被长期持有→其他 create/advance 写请求全部阻塞排队
+# →表现为“锁卡死”。
+# 治本：把 OCR 移出持锁回调，提交到后台线程池执行；
+# 完成后用 modify_task 重新获取短锁写回结果，写回不阻塞推进响应。
+_OCR_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix='ocr-async')
+
+
+def _ocr_review_async_append_flow(task_id, entries):
+    """在独立事务里向指定任务追加 flow_log（OCR 后台回写用，短持锁）。"""
+    def _updater(task):
+        task.setdefault('flow_log', []).extend(entries)
+    try:
+        modify_task(task_id, _updater)
+    except Exception as e:
+        log.warning(f"OCR 异步回写 flow_log 失败 {task_id}: {e}")
+
+
+def _ocr_review_async(task_id, repo_dir):
+    """OCR 审查的后台执行体：先跑审查，再短锁回写结果。不持有推进时的排他锁。"""
+    log.info(f"[OCR-ASYNC] 入口: task={task_id} repo={repo_dir} 线程启动")
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "ocr_auto_trigger",
+            os.path.join(str(SCRIPTS), "ocr_auto_trigger.py"),
+        )
+        ocat = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ocat)
+        trigger_result = ocat.auto_review_and_create_tasks(task_id, repo_dir) or {}
+        created = trigger_result.get('tasks_created') or []
+        entries = []
+        if created:
+            entries.append({
+                'at': now_iso(),
+                'from': 'OCR',
+                'to': '缺陷',
+                'remark': (
+                    f"OCR审查发现 {trigger_result.get('critical_count', 0)}"
+                    " 个高危缺陷，已记录待创建P0任务"
+                ),
+            })
+        # 无论是否建任务都回写 ocr_auto 留痕
+        def _updater(task):
+            task.setdefault('ocr_auto', {})
+            task['ocr_auto']['triggered'] = True
+            task['ocr_auto']['created'] = created
+            task['ocr_auto']['skipped_reason'] = trigger_result.get('reason')
+            if entries:
+                task.setdefault('flow_log', []).extend(entries)
+        try:
+            modify_task(task_id, _updater)
+        except Exception as e:
+            log.warning(f"OCR 异步回写 ocr_auto 失败 {task_id}: {e}")
+        log.info(f"OCR 异步审查完成 {task_id}: created={len(created)} skip={trigger_result.get('reason')}")
+    except Exception as e:
+        log.warning(f"OCR 异步审查执行失败 {task_id}: {e}")
+        _ocr_review_async_append_flow(task_id, [{
+            'at': now_iso(),
+            'from': 'OCR',
+            'to': '(异常)',
+            'remark': f'OCR 异步审查失败: {e}',
+        }])
+
+
+def handle_advance_state(task_id, comment=''):
+    """手动推进任务到下一阶段（解卡用），推进后自动派发对应 Agent。
+    使用 modify_tasks 原子更新。"""
+    result = {'ok': False, 'error': f'任务 {task_id} 不存在'}
+    dispatch_needed = False
+    dispatch_state = None
+
+    def _do_advance(tasks):
+        nonlocal result, dispatch_needed, dispatch_state
+        task = next((t for t in tasks if t.get('id') == task_id), None)
+        if not task:
+            return tasks
+        cur = task.get('state', '')
+        if cur not in _STATE_FLOW:
+            result = {'ok': False, 'error': f'任务 {task_id} 状态为 {cur}，无法推进'}
+            return tasks
+        _ensure_scheduler(task)
+        _scheduler_snapshot(task, f'advance-before-{cur}')
+        next_state, from_dept, to_dept, default_remark = _STATE_FLOW[cur]
+        remark = comment or default_remark
+
+        # ── 六合一门禁钩子（SIX_UNITY 开关，默认过渡模式只留痕不拦截）──
+        def _append_flow(entry):
+            entry.setdefault('at', now_iso())
+            task.setdefault('flow_log', []).append(entry)
+
+        if _SIX_UNITY_AVAILABLE and six_unity is not None:
+            # ① SDD 契约门禁：进 Review 前校验 spec 契约完整
+            if next_state == 'Review':
+                _allow_sdd, _why_sdd = six_unity.sdd_gate(task_id, task, _append_flow)
+                if not _allow_sdd:
+                    result = {'ok': False, 'error': f'SDD 契约不完整，驳回规划部补齐：{_why_sdd}'}
+                    _scheduler_mark_progress(task, f'SDD门禁驳回: {_why_sdd}')
+                    task['updatedAt'] = now_iso()
+                    return tasks
+
+            # ③ 任务分解自查：Menxia → Assigned 时触发七维评分
+            # ⚠️ 缺陷A修复：不再在此独立驳回，统一交由下方 iterate 门禁承担。
+            #    decomp_check 与 iterate 双门禁会导致 enabled()=1 时双驳回、
+            #    block 字段被覆盖。iterate 内部已含七维评分 + gen_remediation。
+            # （保留 decomp_check 能力：iterate->selfcheck 同样走七维评分）
+            if cur == 'Menxia' and next_state == 'Assigned' and not six_unity.enabled():
+                # 过渡模式（SIX_UNITY=0）仅留痕不拦截，供审计观察
+                try:
+                    six_unity.decomp_check(task_id, task, _append_flow)
+                except Exception:
+                    pass
+
+        # ── 六合一 v2：迭代至98%门禁 + 老板确认闸（新）──
+        if six_unity is not None and six_unity.enabled():
+            try:
+                sys.path.insert(0, str(SCRIPTS))
+                import iterate_engine as _ite
+            except Exception as _e:
+                _ite = None
+
+            if _ite is not None and cur == 'Menxia' and next_state == 'Assigned':
+                # 迭代至98%：方案需达到 ≥98 且无短板才允许进入执行
+                if not _ite.is_ready(task)[0]:
+                    _it_res = _ite.iterate(task, max_rounds=3, flow_log_append=_append_flow)
+                    result = {'ok': False,
+                              'error': f'方案落地把握未达98%（评分 {_it_res["score_pct"]}%），已生成补齐动作，请规划部继续细化'}
+                    task['block'] = '方案迭代补齐中'
+                    _scheduler_mark_progress(task, f'迭代门禁: {_it_res["score_pct"]}% <98%，转补齐')
+                    task['updatedAt'] = now_iso()
+                    return tasks
+
+            # 老板确认闸：Assigned → Doing 前，方案必须经老板确认
+            if cur == 'Assigned' and next_state == 'Doing' and \
+                    task.get('spec_status') == 'awaiting_boss' and not task.get('boss_review'):
+                result = {'ok': False, 'error': '方案待老板确认（awaiting_boss），请先调用 /api/boss-confirm 通过或驳回'}
+                _scheduler_mark_progress(task, '老板确认闸拦截：awaiting_boss 未确认')
+                task['updatedAt'] = now_iso()
+                return tasks
+
+            # 六部自动派发：Assigned → Doing 时，把 targetDept 写回 org（若指定）
+            if cur == 'Assigned' and next_state == 'Doing':
+                _td = task.get('targetDept') or ''
+                _td_modern = ORG_MODERN.get(_td, _td) if _td else ''
+                if _td and (_td_modern in ORG_MODERN.values() or _td in ORG_MODERN.values()):
+                    task['org'] = _td_modern or _td
+                    task['now'] = f'执行办已派发至 {task["org"]}'
+                    _append_flow({'from': '执行办', 'to': task['org'], 'remark': f'自动派发至 {task["org"]}'})
+
+        task['state'] = next_state
+        task['now'] = f'⬇️ 手动推进：{remark}'
+        _append_flow({
+            'from': from_dept,
+            'to': to_dept,
+            'remark': f'⬇️ 手动推进：{remark}'
+        })
+        _scheduler_mark_progress(task, f'手动推进 {cur} -> {next_state}')
+        task['updatedAt'] = now_iso()
+
+        # 🔥 OCR 自动审查（异步，治本）：研发主管完成 → 审查 → critical/high 自动建 P0 任务
+        # 不放在持锁回调里同步执行（避免排他锁被 OCR 慢调用长期持有→锁卡死），
+        # 改为后台线程池执行，完成后短持锁回写 task['ocr_auto']。
+        if next_state == 'Review':
+            captured_repo = task.get('repo_dir') or str(BASE.parent)
+            try:
+                _OCR_EXECUTOR.submit(_ocr_review_async, task_id, captured_repo)
+            except Exception as e:
+                log.warning(f"OCR 异步提交失败: {e}")
+
+        # ── SE 经验卡：任务 Done 后异步产出（不阻塞归档）──
+        if next_state == 'Done' and _SIX_UNITY_AVAILABLE and six_unity is not None:
+            try:
+                six_unity.se_try_extract_experience(task_id, task, _append_flow)
+            except Exception as e:
+                log.warning(f"SE 经验卡产出失败: {e}")
+
+        if next_state != 'Done':
+            dispatch_needed = True
+            dispatch_state = next_state
+
+        from_label = _STATE_LABELS.get(cur, cur)
+        to_label = _STATE_LABELS.get(next_state, next_state)
+        dispatched = ' (已自动派发 Agent)' if next_state != 'Done' else ''
+        result = {'ok': True, 'message': f'{task_id} {from_label} → {to_label}{dispatched}'}
+        return tasks
+
+    modify_tasks(_do_advance)
+
+    if dispatch_needed:
+        tasks = load_tasks()
+        task = next((t for t in tasks if t.get('id') == task_id), None)
+        if task:
+            dispatch_for_state(task_id, task, dispatch_state)
+
+    return result
+
+
+def _handle_spec_submit(task_id, spec=None, cdd=None):
+    """六合一 v2：规划部提交 SDD(spec) + CDD(cdd) 契约。
+
+    写入 task['spec'] / task['cdd']，触发一次迭代评分；
+    若 ≥98% 无短板则标记 spec_status='awaiting_boss'（进老板确认闸），
+    否则保留 'pending'（待补）。
+    """
+    result = {'ok': False, 'error': f'任务 {task_id} 不存在'}
+
+    def _do_submit(tasks):
+        nonlocal result
+        task = next((t for t in tasks if t.get('id') == task_id), None)
+        if not task:
+            return tasks
+        if spec is not None:
+            task['spec'] = spec
+        if cdd is not None:
+            task['cdd'] = cdd
+        task.setdefault('flow_log', []).append({
+            'at': now_iso(), 'from': '规划部', 'to': task.get('state', ''),
+            'remark': '提交 SDD+CDD 契约' + ('（含SDD）' if spec else '') + ('（含CDD）' if cdd else ''),
+        })
+        # 触发迭代评分
+        _run_iterate_score(task)
+        # SDD 契约齐全 → 进老板确认闸
+        try:
+            sys.path.insert(0, str(SCRIPTS))
+            import iterate_engine as _ite
+            ready, _ = _ite.is_ready(task)
+        except Exception:
+            ready = False
+        task['spec_status'] = 'awaiting_boss' if ready else 'pending'
+        if ready:
+            task.setdefault('flow_log', []).append({
+                'at': now_iso(), 'from': '迭代引擎', 'to': '老板确认',
+                'remark': '方案就绪（≥98%），进入老板确认闸',
+            })
+        task['updatedAt'] = now_iso()
+        result = {'ok': True, 'message': f'{task_id} 契约已提交，spec_status={task["spec_status"]}',
+                  'spec_status': task['spec_status'],
+                  'iterate': (task.get('decomp_audit') or {}).get('iterate') or {}}
+        return tasks
+
+    modify_tasks(_do_submit)
+    return result
+
+
+def _handle_boss_confirm(task_id, decision, comment=''):
+    """六合一 v2：老板确认闸。
+
+    decision:
+      approve → 老板通过，清除 awaiting_boss，可继续推进到执行
+      reject  → 老板驳回，退回规划部修订（含意见）
+      skip    → 老板明确"方案已定只让六部落地"，豁免确认直接放行
+    """
+    result = {'ok': False, 'error': f'任务 {task_id} 不存在'}
+
+    def _do_confirm(tasks):
+        nonlocal result
+        task = next((t for t in tasks if t.get('id') == task_id), None)
+        if not task:
+            return tasks
+        task.setdefault('flow_log', []).append({
+            'at': now_iso(), 'from': '老板', 'to': task.get('state', ''),
+            'remark': f'老板确认[{decision}]：{comment or "（无意见）"}',
+        })
+        if decision == 'approve':
+            task['boss_review'] = {'decision': 'approve', 'comment': comment, 'at': now_iso()}
+            task['spec_status'] = 'reviewed'
+            task['now'] = '老板已确认方案，可推进执行'
+            result = {'ok': True, 'message': f'{task_id} 老板通过，可推进执行'}
+        elif decision == 'reject':
+            task['boss_review'] = {'decision': 'reject', 'comment': comment, 'at': now_iso()}
+            task['spec_status'] = 'pending'
+            task['state'] = 'Zhongshu'  # 退回规划部
+            task['now'] = f'老板驳回，退回规划部修订：{comment or ""}'
+            task['block'] = ''
+            task.setdefault('flow_log', []).append({
+                'at': now_iso(), 'from': '老板', 'to': '规划部',
+                'remark': f'驳回退回规划部：{comment or ""}',
+            })
+            result = {'ok': True, 'message': f'{task_id} 老板驳回，退回规划部', 'state': 'Zhongshu'}
+        else:  # skip 豁免
+            task['boss_review'] = {'decision': 'skip', 'comment': comment, 'at': now_iso()}
+            task['spec_status'] = 'reviewed'
+            task['now'] = '老板豁免确认（方案已定），直接放行'
+            result = {'ok': True, 'message': f'{task_id} 老板豁免确认，放行执行'}
+        task['updatedAt'] = now_iso()
+        return tasks
+
+    modify_tasks(_do_confirm)
+    return result
+
+
+def _handle_qa_result(task_id, verdict, report=''):
+    """六合一 v2：品控验收提交。
+
+    PASS → 允许推进到 Done；FAIL → 自动打回对应执行部门（写 flow_log）。
+    """
+    result = {'ok': False, 'error': f'任务 {task_id} 不存在'}
+
+    def _do_qa(tasks):
+        nonlocal result
+        task = next((t for t in tasks if t.get('id') == task_id), None)
+        if not task:
+            return tasks
+        task.setdefault('flow_log', []).append({
+            'at': now_iso(), 'from': '品控官', 'to': task.get('state', ''),
+            'remark': f'品控验收[{verdict}]：{report or "（无报告）"}',
+        })
+        task['qa'] = {'verdict': verdict, 'report': report, 'at': now_iso()}
+        if verdict == 'PASS':
+            task['now'] = '品控验收通过，可完成'
+            result = {'ok': True, 'message': f'{task_id} 品控PASS，可推进 Done', 'qa': task['qa']}
+        else:
+            # FAIL：打回执行部门（org 对应部门）
+            back_dept = task.get('org') or '执行部门'
+            task['state'] = 'Doing'
+            task['block'] = f'品控打回：{report or "验收未通过"}'
+            task['now'] = f'品控验收未通过，退回{back_dept}整改'
+            task.setdefault('flow_log', []).append({
+                'at': now_iso(), 'from': '品控官', 'to': back_dept,
+                'remark': f'打回整改：{report or "验收未通过"}',
+            })
+            result = {'ok': True, 'message': f'{task_id} 品控FAIL，打回{back_dept}整改', 'state': 'Doing'}
+        task['updatedAt'] = now_iso()
+        return tasks
+
+    modify_tasks(_do_qa)
+    return result
+
+
+def _run_iterate_score(task):
+    """触发迭代评分并把 iterate 结果落盘到 task['decomp_audit']（供 _handle_spec_submit 复用）。"""
+    try:
+        sys.path.insert(0, str(SCRIPTS))
+        import iterate_engine as _ite
+        _ite.iterate(task, max_rounds=1)
+    except Exception as e:
+        log.warning(f'迭代评分失败: {e}')
+        if not isinstance(task.get('decomp_audit'), dict):
+            task['decomp_audit'] = {}
+        task['decomp_audit']['iterate'] = {'error': str(e)}
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        # 只记录 4xx/5xx 错误请求
+        if args and len(args) >= 1:
+            status = str(args[0]) if args else ''
+            if status.startswith('4') or status.startswith('5'):
+                log.warning(f'{self.client_address[0]} {fmt % args}')
+
+    def handle_error(self):
+        pass  # 静默处理连接错误，避免 BrokenPipe 崩溃
+
+    def handle(self):
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # 客户端断开连接，忽略
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        cors_headers(self)
+        self.end_headers()
+
+    def send_json(self, data, code=200):
+        try:
+            body = json.dumps(data, ensure_ascii=False).encode()
+            self.send_response(code)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            cors_headers(self)
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def send_file(self, path: pathlib.Path, mime='text/html; charset=utf-8'):
+        if not path.exists():
+            self.send_error(404)
+            return
+        try:
+            body = path.read_bytes()
+            self.send_response(200)
+            self.send_header('Content-Type', mime)
+            self.send_header('Content-Length', str(len(body)))
+            cors_headers(self)
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _serve_static(self, rel_path):
+        """从 dist/ 目录提供静态文件。"""
+        safe = rel_path.replace('\\', '/').lstrip('/')
+        if '..' in safe:
+            self.send_error(403)
+            return True
+        fp = DIST / safe
+        if fp.is_file():
+            mime = _MIME_TYPES.get(fp.suffix.lower(), 'application/octet-stream')
+            self.send_file(fp, mime)
+            return True
+        return False
+
+    def _check_auth(self):
+        """检查认证，未通过返回 True（已发送 401 响应）。
+        
+        认证优先级：
+        1. X-API-Token 头（Agent 自动化调用，重启不变）
+        2. Authorization: Bearer 或 Cookie（用户登录 session）
+        """
+        p = urlparse(self.path).path.rstrip('/')
+        if not requires_auth(p):
+            return False
+        # 优先检查 API Token（Agent 自动化调用）
+        api_token = self.headers.get('X-API-Token', '')
+        if api_token and verify_api_token(api_token):
+            return False
+        # 其次检查用户登录 token
+        token = extract_token(self.headers)
+        if not token or not verify_token(token):
+            self.send_json({'ok': False, 'error': '未登录或会话已过期'}, 401)
+            return True
+        return False
+
+    def do_GET(self):
+        p = urlparse(self.path).path.rstrip('/')
+        # 认证状态端点（公开）
+        if p == '/api/auth/status':
+            self.send_json({'enabled': auth_enabled(), 'configured': auth_configured()})
+            return
+        if self._check_auth():
+            return
+        if p in ('', '/dashboard', '/dashboard.html'):
+            idx = DIST / 'index.html'
+            if idx.exists():
+                self.send_file(idx)
+            else:
+                self.send_file(BASE / 'dashboard.html')
+        elif p == '/provider-keys':
+            self.send_file(DIST / 'provider-keys.html')
+        elif p == '/healthz':
+            task_data_dir = get_task_data_dir()
+            checks = {'dataDir': task_data_dir.is_dir(), 'tasksReadable': (task_data_dir / 'tasks_source.json').exists()}
+            checks['dataWritable'] = os.access(str(task_data_dir), os.W_OK)
+            all_ok = all(checks.values())
+            self.send_json({'status': 'ok' if all_ok else 'degraded', 'ts': now_iso(), 'checks': checks})
+        elif p == '/api/live-status':
+            task_data_dir = get_task_data_dir()
+            self.send_json(_cache_read_json(task_data_dir / 'live_status.json'))
+        elif p == '/api/six-unity':
+            # 六合一可观测审计端点：汇总各柱子留痕统计
+            self.send_json(_build_six_unity_report())
+        elif p == '/api/agent-config':
+            self.send_json(_cache_read_json(DATA / 'agent_config.json'))
+        elif p == '/api/model-change-log':
+            self.send_json(_cache_read_json(DATA / 'model_change_log.json', []))
+        elif p == '/api/last-result':
+            self.send_json(_cache_read_json(DATA / 'last_model_change_result.json', {}))
+        elif p == '/api/officials-stats':
+            self.send_json(_cache_read_json(DATA / 'officials_stats.json', {}))
+        elif p == '/api/morning-brief':
+            self.send_json(_cache_read_json(DATA / 'morning_brief.json', {}))
+        elif p == '/api/morning-config':
+            migrate_notification_config()
+            self.send_json(read_json(DATA / 'morning_brief_config.json', {
+                'categories': [
+                    {'name': '政治', 'enabled': True},
+                    {'name': '军事', 'enabled': True},
+                    {'name': '经济', 'enabled': True},
+                    {'name': 'AI大模型', 'enabled': True},
+                ],
+                'keywords': [], 'custom_feeds': [],
+                'notification': {'enabled': True, 'channel': 'feishu', 'webhook': ''},
+            }))
+        elif p == '/api/notification-channels':
+            self.send_json({'ok': True, 'channels': get_channel_info()})
+        elif p.startswith('/api/morning-brief/'):
+            date = p.split('/')[-1]
+            # 标准化日期格式为 YYYYMMDD（兼容 YYYY-MM-DD 输入）
+            date_clean = date.replace('-', '')
+            if not date_clean.isdigit() or len(date_clean) != 8:
+                self.send_json({'ok': False, 'error': f'日期格式无效: {date}，请使用 YYYYMMDD'}, 400)
+                return
+            self.send_json(read_json(DATA / f'morning_brief_{date_clean}.json', {}))
+        elif p == '/api/remote-skills-list':
+            self.send_json(get_remote_skills_list())
+        elif p.startswith('/api/skill-content/'):
+            # /api/skill-content/{agentId}/{skillName}
+            parts = p.replace('/api/skill-content/', '').split('/', 1)
+            if len(parts) == 2:
+                self.send_json(read_skill_content(parts[0], parts[1]))
+            else:
+                self.send_json({'ok': False, 'error': 'Usage: /api/skill-content/{agentId}/{skillName}'}, 400)
+        elif p.startswith('/api/task-activity/'):
+            task_id = p.replace('/api/task-activity/', '')
+            if not task_id:
+                self.send_json({'ok': False, 'error': 'task_id required'}, 400)
+            else:
+                self.send_json(get_task_activity(task_id))
+        elif p.startswith('/api/scheduler-state/'):
+            task_id = p.replace('/api/scheduler-state/', '')
+            if not task_id:
+                self.send_json({'ok': False, 'error': 'task_id required'}, 400)
+            else:
+                self.send_json(get_scheduler_state(task_id))
+        elif p == '/api/agents-status':
+            self.send_json(get_agents_status())
+        elif p.startswith('/api/task-output/'):
+            task_id = p.replace('/api/task-output/', '')
+            if not task_id or not _SAFE_NAME_RE.match(task_id):
+                self.send_json({'ok': False, 'error': 'invalid task_id'}, 400)
+            else:
+                tasks = load_tasks()
+                task = next((t for t in tasks if t.get('id') == task_id), None)
+                if not task:
+                    self.send_json({'ok': False, 'error': 'task not found'}, 404)
+                else:
+                    output_path = task.get('output', '')
+                    if not output_path or output_path == '-':
+                        self.send_json({'ok': True, 'taskId': task_id, 'content': '', 'exists': False})
+                    else:
+                        p_out = pathlib.Path(output_path)
+                        if not p_out.exists():
+                            self.send_json({'ok': True, 'taskId': task_id, 'content': '', 'exists': False})
+                        else:
+                            try:
+                                content = p_out.read_text(encoding='utf-8', errors='replace')[:50000]
+                                self.send_json({'ok': True, 'taskId': task_id, 'content': content, 'exists': True})
+                            except Exception as e:
+                                self.send_json({'ok': False, 'error': f'读取失败: {e}'}, 500)
+        elif p.startswith('/api/agent-activity/'):
+            agent_id = p.replace('/api/agent-activity/', '')
+            if not agent_id or not _SAFE_NAME_RE.match(agent_id):
+                self.send_json({'ok': False, 'error': 'invalid agent_id'}, 400)
+            else:
+                self.send_json({'ok': True, 'agentId': agent_id, 'activity': get_agent_activity(agent_id)})
+        # ── 会话映射 ──
+        elif p == '/api/sessions-mapping':
+            self.send_json(get_sessions_mapping())
+        # ── 系统健康 ──
+        elif p == '/api/system-health':
+            self.send_json(get_system_health())
+        # ── 朝堂议政 ──
+        elif p == '/api/court-discuss/list':
+            self.send_json({'ok': True, 'sessions': cd_list()})
+        elif p == '/api/court-discuss/officials':
+            self.send_json({'ok': True, 'officials': CD_PROFILES})
+        # ── Provider API Key 管理（只读）──
+        elif p == '/api/provider-keys':
+            self.send_json(get_provider_keys())
+        elif p.startswith('/api/court-discuss/session/'):
+            sid = p.replace('/api/court-discuss/session/', '')
+            data = cd_get(sid)
+            self.send_json(data if data else {'ok': False, 'error': 'session not found'}, 200 if data else 404)
+        elif p == '/api/court-discuss/fate':
+            self.send_json({'ok': True, 'event': cd_fate()})
+        elif p == '/api/ocr/status':
+            # open-code-review 集成状态（动态加载 ocr_bridge，避免硬依赖）
+            try:
+                import importlib.util
+                spec = importlib.util.spec_from_file_location(
+                    'ocr_bridge', str(SCRIPTS / 'ocr_bridge.py'))
+                ocr_bridge = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(ocr_bridge)
+                self.send_json(ocr_bridge.ocr_status())
+            except Exception:
+                self.send_json({'ok': False, 'error': 'ocr_bridge 不可用'}, 500)
+        elif self._serve_static(p):
+            pass  # 已由 _serve_static 处理 (JS/CSS/图片等)
+        else:
+            # SPA fallback：非 /api/ 路径返回 index.html，无则 dashboard.html
+            if not p.startswith('/api/'):
+                idx = DIST / 'index.html'
+                if idx.exists():
+                    self.send_file(idx)
+                    return
+                self.send_file(BASE / 'dashboard.html')
+                return
+            log.debug(f'404 未匹配路径: {self.path}')
+            self.send_error(404)
+
+    def do_POST(self):
+        p = urlparse(self.path).path.rstrip('/')
+        length = int(self.headers.get('Content-Length', 0))
+        if length > MAX_REQUEST_BODY:
+            self.send_json({'ok': False, 'error': f'Request body too large (max {MAX_REQUEST_BODY} bytes)'}, 413)
+            return
+        raw = self.rfile.read(length) if length else b''
+        try:
+            body = json.loads(raw) if raw else {}
+        except Exception:
+            self.send_json({'ok': False, 'error': 'invalid JSON'}, 400)
+            return
+
+        # ── 认证端点（公开） ──
+        if p == '/api/auth/setup':
+            pw = body.get('password', '')
+            if not isinstance(pw, str) or not pw:
+                self.send_json({'ok': False, 'error': '请提供密码'}, 400)
+                return
+            self.send_json(setup_password(pw))
+            return
+        if p == '/api/auth/login':
+            pw = body.get('password', '')
+            if not isinstance(pw, str) or not pw:
+                self.send_json({'ok': False, 'error': '请提供密码'}, 400)
+                return
+            if verify_password(pw):
+                token = create_token()
+                resp = {'ok': True, 'token': token}
+                # 同时设置 HttpOnly cookie
+                try:
+                    body_bytes = json.dumps(resp, ensure_ascii=False).encode()
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json; charset=utf-8')
+                    self.send_header('Content-Length', str(len(body_bytes)))
+                    self.send_header('Set-Cookie', f'edict_token={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400')
+                    cors_headers(self)
+                    self.end_headers()
+                    self.wfile.write(body_bytes)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+            else:
+                self.send_json({'ok': False, 'error': '密码错误'}, 401)
+            return
+
+        # ── 认证检查 ──
+        if self._check_auth():
+            return
+
+        if p == '/api/morning-config':
+            if not isinstance(body, dict):
+                self.send_json({'ok': False, 'error': '请求体必须是 JSON 对象'}, 400)
+                return
+            allowed_keys = {'categories', 'keywords', 'custom_feeds', 'notification', 'feishu_webhook'}
+            unknown = set(body.keys()) - allowed_keys
+            if unknown:
+                self.send_json({'ok': False, 'error': f'未知字段: {", ".join(unknown)}'}, 400)
+                return
+            if 'categories' in body and not isinstance(body['categories'], list):
+                self.send_json({'ok': False, 'error': 'categories 必须是数组'}, 400)
+                return
+            if 'keywords' in body and not isinstance(body['keywords'], list):
+                self.send_json({'ok': False, 'error': 'keywords 必须是数组'}, 400)
+                return
+            if 'notification' in body:
+                noti = body['notification']
+                if not isinstance(noti, dict):
+                    self.send_json({'ok': False, 'error': 'notification 必须是对象'}, 400)
+                    return
+                channel_type = noti.get('channel', 'feishu')
+                if channel_type not in NOTIFICATION_CHANNELS:
+                    self.send_json({'ok': False, 'error': f'不支持的渠道: {channel_type}'}, 400)
+                    return
+                webhook = noti.get('webhook', '').strip()
+                if webhook:
+                    channel_cls = get_channel(channel_type)
+                    if channel_cls and not channel_cls.validate_webhook(webhook):
+                        self.send_json({'ok': False, 'error': f'{channel_cls.label} Webhook URL 无效'}, 400)
+                        return
+            webhook_legacy = body.get('feishu_webhook', '').strip()
+            if webhook_legacy and 'notification' not in body:
+                body['notification'] = {'enabled': True, 'channel': 'feishu', 'webhook': webhook_legacy}
+            cfg_path = DATA / 'morning_brief_config.json'
+            cfg_path.write_text(json.dumps(body, ensure_ascii=False, indent=2))
+            self.send_json({'ok': True, 'message': '订阅配置已保存'})
+            return
+
+        if p == '/api/scheduler-scan':
+            threshold_sec = body.get('thresholdSec', 600)
+            try:
+                result = handle_scheduler_scan(threshold_sec)
+                self.send_json(result)
+            except Exception as e:
+                self.send_json({'ok': False, 'error': f'scheduler scan failed: {e}'}, 500)
+            return
+
+        if p == '/api/smart-unstuck':
+            threshold_hours = body.get('thresholdHours', 12)
+            try:
+                result = handle_smart_unstuck(threshold_hours)
+                self.send_json(result)
+            except Exception as e:
+                self.send_json({'ok': False, 'error': f'smart unstuck failed: {e}'}, 500)
+            return
+
+        if p == '/api/deep-clean':
+            try:
+                result = handle_deep_clean()
+                self.send_json(result)
+            except Exception as e:
+                self.send_json({'ok': False, 'error': f'deep clean failed: {e}'}, 500)
+            return
+
+        if p == '/api/repair-flow-order':
+            try:
+                self.send_json(handle_repair_flow_order())
+            except Exception as e:
+                self.send_json({'ok': False, 'error': f'repair flow order failed: {e}'}, 500)
+            return
+
+        if p == '/api/scheduler-retry':
+            task_id = body.get('taskId', '').strip()
+            reason = body.get('reason', '').strip()
+            if not task_id:
+                self.send_json({'ok': False, 'error': 'taskId required'}, 400)
+                return
+            self.send_json(handle_scheduler_retry(task_id, reason))
+            return
+
+        if p == '/api/scheduler-escalate':
+            task_id = body.get('taskId', '').strip()
+            reason = body.get('reason', '').strip()
+            if not task_id:
+                self.send_json({'ok': False, 'error': 'taskId required'}, 400)
+                return
+            self.send_json(handle_scheduler_escalate(task_id, reason))
+            return
+
+        if p == '/api/scheduler-rollback':
+            task_id = body.get('taskId', '').strip()
+            reason = body.get('reason', '').strip()
+            if not task_id:
+                self.send_json({'ok': False, 'error': 'taskId required'}, 400)
+                return
+            self.send_json(handle_scheduler_rollback(task_id, reason))
+            return
+
+        if p == '/api/morning-brief/refresh':
+            force = body.get('force', True)  # 从看板手动触发默认强制
+            def do_refresh():
+                try:
+                    cmd = [python_bin(), str(SCRIPTS / 'fetch_morning_news.py')]
+                    if force:
+                        cmd.append('--force')
+                    subprocess.run(cmd, timeout=120)
+                    push_to_feishu()
+                except Exception as e:
+                    print(f'[refresh error] {e}', file=sys.stderr)
+            threading.Thread(target=do_refresh, daemon=True).start()
+            self.send_json({'ok': True, 'message': '采集已触发，约30-60秒后刷新'})
+            return
+
+        if p == '/api/toggle-global-skill':
+            agent_id = body.get('agentId', '').strip()
+            skill_name = body.get('skillName', '').strip()
+            enabled = body.get('enabled', False)
+            if not agent_id or not skill_name:
+                self.send_json({'ok': False, 'error': 'agentId and skillName required'}, 400)
+                return
+            result = toggle_global_skill(agent_id, skill_name, enabled)
+            self.send_json(result)
+            return
+
+        if p == '/api/add-skill':
+            agent_id = body.get('agentId', '').strip()
+            skill_name = body.get('skillName', body.get('name', '')).strip()
+            desc = body.get('description', '').strip() or skill_name
+            trigger = body.get('trigger', '').strip()
+            if not agent_id or not skill_name:
+                self.send_json({'ok': False, 'error': 'agentId and skillName required'}, 400)
+                return
+            result = add_skill_to_agent(agent_id, skill_name, desc, trigger)
+            self.send_json(result)
+            return
+
+        if p == '/api/add-remote-skill':
+            agent_id = body.get('agentId', '').strip()
+            skill_name = body.get('skillName', '').strip()
+            source_url = body.get('sourceUrl', '').strip()
+            description = body.get('description', '').strip()
+            if not agent_id or not skill_name or not source_url:
+                self.send_json({'ok': False, 'error': 'agentId, skillName, and sourceUrl required'}, 400)
+                return
+            result = add_remote_skill(agent_id, skill_name, source_url, description)
+            self.send_json(result)
+            return
+
+        if p == '/api/remote-skills-list':
+            result = get_remote_skills_list()
+            self.send_json(result)
+            return
+
+        if p == '/api/update-remote-skill':
+            agent_id = body.get('agentId', '').strip()
+            skill_name = body.get('skillName', '').strip()
+            if not agent_id or not skill_name:
+                self.send_json({'ok': False, 'error': 'agentId and skillName required'}, 400)
+                return
+            result = update_remote_skill(agent_id, skill_name)
+            self.send_json(result)
+            return
+
+        if p == '/api/remove-remote-skill':
+            agent_id = body.get('agentId', '').strip()
+            skill_name = body.get('skillName', '').strip()
+            if not agent_id or not skill_name:
+                self.send_json({'ok': False, 'error': 'agentId and skillName required'}, 400)
+                return
+            result = remove_remote_skill(agent_id, skill_name)
+            self.send_json(result)
+            return
+
+        if p == '/api/task-action':
+            task_id = body.get('taskId', '').strip()
+            action = body.get('action', '').strip()  # stop, cancel, resume
+            reason = body.get('reason', '').strip() or f'老板从看板{action}'
+            if not task_id or action not in ('stop', 'cancel', 'resume'):
+                self.send_json({'ok': False, 'error': 'taskId and action(stop/cancel/resume) required'}, 400)
+                return
+            result = handle_task_action(task_id, action, reason)
+            self.send_json(result)
+            return
+
+        if p == '/api/archive-task':
+            task_id = body.get('taskId', '').strip() if body.get('taskId') else ''
+            archived = body.get('archived', True)
+            archive_all = body.get('archiveAllDone', False)
+            if not task_id and not archive_all:
+                self.send_json({'ok': False, 'error': 'taskId or archiveAllDone required'}, 400)
+                return
+            result = handle_archive_task(task_id, archived, archive_all)
+            self.send_json(result)
+            return
+
+        if p == '/api/task-todos':
+            task_id = body.get('taskId', '').strip()
+            todos = body.get('todos', [])  # [{id, title, status}]
+            if not task_id:
+                self.send_json({'ok': False, 'error': 'taskId required'}, 400)
+                return
+            # todos 输入校验
+            if not isinstance(todos, list) or len(todos) > 200:
+                self.send_json({'ok': False, 'error': 'todos must be a list (max 200 items)'}, 400)
+                return
+            valid_statuses = {'not-started', 'in-progress', 'completed'}
+            for td in todos:
+                if not isinstance(td, dict) or 'id' not in td or 'title' not in td:
+                    self.send_json({'ok': False, 'error': 'each todo must have id and title'}, 400)
+                    return
+                if td.get('status', 'not-started') not in valid_statuses:
+                    td['status'] = 'not-started'
+            result = update_task_todos(task_id, todos)
+            self.send_json(result)
+            return
+
+        if p == '/api/create-task':
+            title = body.get('title', '').strip()
+            org = body.get('org', '规划部').strip()
+            official = body.get('official', '规划师').strip()
+            priority = body.get('priority', 'normal').strip()
+            template_id = body.get('templateId', '')
+            params = body.get('params', {})
+            if not title:
+                self.send_json({'ok': False, 'error': 'title required'}, 400)
+                return
+            target_dept = body.get('targetDept', '').strip()
+            result = handle_create_task(title, org, official, priority, template_id, params, target_dept)
+            self.send_json(result)
+            return
+
+        if p == '/api/review-action':
+            task_id = body.get('taskId', '').strip()
+            action = body.get('action', '').strip()  # approve, reject
+            comment = body.get('comment', '').strip()
+            if not task_id or action not in ('approve', 'reject'):
+                self.send_json({'ok': False, 'error': 'taskId and action(approve/reject) required'}, 400)
+                return
+            result = handle_review_action(task_id, action, comment)
+            self.send_json(result)
+            return
+
+        if p == '/api/advance-state':
+            task_id = body.get('taskId', '').strip()
+            comment = body.get('comment', '').strip()
+            if not task_id:
+                self.send_json({'ok': False, 'error': 'taskId required'}, 400)
+                return
+            result = handle_advance_state(task_id, comment)
+            self.send_json(result)
+            return
+
+        if p == '/api/spec-submit':
+            # 六合一 v2：规划部提交 SDD+CDD 契约
+            task_id = body.get('taskId', '').strip()
+            spec = body.get('spec')
+            cdd = body.get('cdd')
+            if not task_id:
+                self.send_json({'ok': False, 'error': 'taskId required'}, 400)
+                return
+            if not isinstance(spec, dict) and not isinstance(cdd, dict):
+                self.send_json({'ok': False, 'error': 'spec 或 cdd 至少提交一个（均为 dict）'}, 400)
+                return
+            result = _handle_spec_submit(task_id, spec if isinstance(spec, dict) else None,
+                                         cdd if isinstance(cdd, dict) else None)
+            self.send_json(result)
+            return
+
+        if p == '/api/boss-confirm':
+            # 六合一 v2：老板确认闸（awaiting_boss）—— 通过/驳回/豁免
+            task_id = body.get('taskId', '').strip()
+            decision = body.get('decision', '').strip()  # approve|reject|skip
+            comment = body.get('comment', '').strip()
+            if not task_id or decision not in ('approve', 'reject', 'skip'):
+                self.send_json({'ok': False, 'error': 'taskId and decision(approve/reject/skip) required'}, 400)
+                return
+            result = _handle_boss_confirm(task_id, decision, comment)
+            self.send_json(result)
+            return
+
+        if p == '/api/qa-result':
+            # 六合一 v2：品控验收提交（PASS/FAIL）
+            task_id = body.get('taskId', '').strip()
+            verdict = body.get('verdict', '').strip().upper()  # PASS|FAIL
+            report = body.get('report', '').strip()
+            if not task_id or verdict not in ('PASS', 'FAIL'):
+                self.send_json({'ok': False, 'error': 'taskId and verdict(PASS/FAIL) required'}, 400)
+                return
+            result = _handle_qa_result(task_id, verdict, report)
+            self.send_json(result)
+            return
+
+        if p == '/api/agent-wake':
+            agent_id = body.get('agentId', '').strip()
+            message = body.get('message', '').strip()
+            if not agent_id:
+                self.send_json({'ok': False, 'error': 'agentId required'}, 400)
+                return
+            result = wake_agent(agent_id, message)
+            self.send_json(result)
+            return
+
+        if p == '/api/set-model':
+            agent_id = body.get('agentId', '').strip()
+            model = body.get('model', '').strip()
+            if not agent_id or not model:
+                self.send_json({'ok': False, 'error': 'agentId and model required'}, 400)
+                return
+
+            # Write to pending (atomic)
+            pending_path = DATA / 'pending_model_changes.json'
+            def update_pending(current):
+                current = [x for x in current if x.get('agentId') != agent_id]
+                current.append({'agentId': agent_id, 'model': model})
+                return current
+            atomic_json_update(pending_path, update_pending, [])
+
+            # Async apply
+            def apply_async():
+                try:
+                    subprocess.run([python_bin(), str(SCRIPTS / 'apply_model_changes.py')], timeout=30)
+                    subprocess.run([python_bin(), str(SCRIPTS / 'sync_agent_config.py')], timeout=10)
+                except Exception as e:
+                    print(f'[apply error] {e}', file=sys.stderr)
+
+            threading.Thread(target=apply_async, daemon=True).start()
+            self.send_json({'ok': True, 'message': f'Queued: {agent_id} → {model}'})
+
+        # Fix #139: 设置派发渠道（feishu/telegram/wecom/signal/tui）
+        elif p == '/api/set-dispatch-channel':
+            channel = body.get('channel', '').strip()
+            allowed = {'feishu', 'telegram', 'wecom', 'signal', 'tui', 'discord', 'slack'}
+            if channel and channel not in allowed:
+                self.send_json({'ok': False, 'error': f'channel must be one of: {", ".join(sorted(allowed))} (or empty to disable)'}, 400)
+                return
+            def _set_channel(cfg):
+                cfg['dispatchChannel'] = channel
+                return cfg
+            atomic_json_update(DATA / 'agent_config.json', _set_channel, {})
+            label = f'派发渠道已切换为 {channel}' if channel else '派发渠道已关闭'
+            self.send_json({'ok': True, 'message': label})
+
+        # ── Provider API Key 管理 ──
+        elif p == '/api/provider-key':
+            # POST: 更新 Provider API Key
+            provider_name = body.get('provider', '').strip()
+            new_key = body.get('apiKey', '').strip()
+            if not provider_name or not new_key:
+                self.send_json({'ok': False, 'error': 'provider and apiKey required'}, 400)
+                return
+
+            cfg = read_json(OPENCLAW_HOME / 'openclaw.json', {})
+            providers = cfg.get('models', {}).get('providers', {})
+            if provider_name not in providers:
+                self.send_json({'ok': False, 'error': f'Provider {provider_name} 不存在'}, 404)
+                return
+
+            # 备份
+            bak = OPENCLAW_HOME / f'openclaw.json.bak.key-{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}'
+            shutil.copy2(OPENCLAW_HOME / 'openclaw.json', bak)
+
+            # 更新
+            providers[provider_name]['apiKey'] = new_key
+            atomic_json_write(OPENCLAW_HOME / 'openclaw.json', cfg)
+
+            # 异步重启 Gateway
+            def _restart_for_key():
+                try:
+                    r = subprocess.run(['openclaw', 'gateway', 'restart'], capture_output=True, text=True, timeout=30)
+                    log.info(f'Provider key 更新后 Gateway 重启 rc={r.returncode}')
+                except Exception as e:
+                    log.error(f'Provider key 更新后 Gateway 重启失败: {e}')
+                    # 回滚
+                    if bak.exists():
+                        shutil.copy2(bak, OPENCLAW_HOME / 'openclaw.json')
+                        log.warning('已回滚 openclaw.json')
+
+            threading.Thread(target=_restart_for_key, daemon=True).start()
+
+            masked = new_key[:8] + '…' + new_key[-4:] if len(new_key) > 12 else '***'
+            self.send_json({'ok': True, 'message': f'{provider_name} API Key 已更新（{masked}），Gateway 重启中', 'provider': provider_name})
+
+        # ── 朝堂议政 POST ──
+        elif p == '/api/court-discuss/start':
+            topic = body.get('topic', '').strip()
+            officials = body.get('officials', [])
+            task_id = body.get('taskId', '').strip()
+            if not topic:
+                self.send_json({'ok': False, 'error': 'topic required'}, 400)
+                return
+            if not officials or not isinstance(officials, list):
+                self.send_json({'ok': False, 'error': 'officials list required'}, 400)
+                return
+            # 校验官员 ID
+            valid_ids = set(CD_PROFILES.keys())
+            officials = [o for o in officials if o in valid_ids]
+            if len(officials) < 2:
+                self.send_json({'ok': False, 'error': '至少选择2位官员'}, 400)
+                return
+            self.send_json(cd_create(topic, officials, task_id))
+
+        elif p == '/api/court-discuss/advance':
+            sid = body.get('sessionId', '').strip()
+            user_msg = body.get('userMessage', '').strip() or None
+            decree = body.get('decree', '').strip() or None
+            if not sid:
+                self.send_json({'ok': False, 'error': 'sessionId required'}, 400)
+                return
+            self.send_json(cd_advance(sid, user_msg, decree))
+
+        elif p == '/api/court-discuss/conclude':
+            sid = body.get('sessionId', '').strip()
+            if not sid:
+                self.send_json({'ok': False, 'error': 'sessionId required'}, 400)
+                return
+            self.send_json(cd_conclude(sid))
+
+        elif p == '/api/court-discuss/destroy':
+            sid = body.get('sessionId', '').strip()
+            if sid:
+                cd_destroy(sid)
+            self.send_json({'ok': True})
+
+        # ── open-code-review 代码审查端点 ──
+        elif p == '/api/ocr/review':
+            if not body.get('repoDir'):
+                self.send_json({'ok': False, 'error': '缺少 repoDir'}, 400)
+                return
+            try:
+                import importlib.util
+                spec = importlib.util.spec_from_file_location(
+                    'ocr_bridge', str(SCRIPTS / 'ocr_bridge.py'))
+                ocr_bridge = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(ocr_bridge)
+                result = ocr_bridge.ocr_review(
+                    body['repoDir'],
+                    body.get('rulePath'),
+                    body.get('from'),
+                    body.get('to'),
+                )
+                response = result.to_dict()
+                if body.get('taskId') and result.success:
+                    response['stored_at'] = ocr_bridge.save_ocr_result(body['taskId'], result)
+                self.send_json(response)
+            except Exception as e:
+                self.send_json({'ok': False, 'error': str(e)}, 500)
+
+        elif p == '/api/ocr/scan':
+            if not body.get('repoDir'):
+                self.send_json({'ok': False, 'error': '缺少 repoDir'}, 400)
+                return
+            try:
+                import importlib.util
+                spec = importlib.util.spec_from_file_location(
+                    'ocr_bridge', str(SCRIPTS / 'ocr_bridge.py'))
+                ocr_bridge = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(ocr_bridge)
+                result = ocr_bridge.ocr_scan(
+                    body['repoDir'],
+                    body.get('rulePath'),
+                    body.get('paths'),
+                )
+                response = result.to_dict()
+                if body.get('taskId') and result.success:
+                    response['stored_at'] = ocr_bridge.save_ocr_result(body['taskId'], result)
+                self.send_json(response)
+            except Exception as e:
+                self.send_json({'ok': False, 'error': str(e)}, 500)
+
+        elif p == '/api/ocr/resume':
+            if not body.get('repoDir') or not body.get('sessionId'):
+                self.send_json({'ok': False, 'error': '缺少 repoDir 或 sessionId'}, 400)
+                return
+            try:
+                import importlib.util
+                spec = importlib.util.spec_from_file_location(
+                    'ocr_bridge', str(SCRIPTS / 'ocr_bridge.py'))
+                ocr_bridge = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(ocr_bridge)
+                result = ocr_bridge.ocr_resume(
+                    body['sessionId'],
+                    body['repoDir'],
+                    body.get('rulePath'),
+                )
+                response = result.to_dict()
+                if body.get('taskId') and result.success:
+                    response['stored_at'] = ocr_bridge.save_ocr_result(body['taskId'], result)
+                self.send_json(response)
+            except Exception as e:
+                self.send_json({'ok': False, 'error': str(e)}, 500)
+
+        elif p == '/api/ocr/results':
+            try:
+                results_dir = BASE.parent / 'data' / 'ocr_results'
+                if not results_dir.exists():
+                    self.send_json({'results': []})
+                    return
+                task_id = body.get('taskId', '')
+                session_id = body.get('sessionId', '')
+                matching = []
+                for fname in results_dir.iterdir():
+                    if not fname.name.endswith('.json') or fname.name.endswith('.tmp'):
+                        continue
+                    if task_id and not fname.name.startswith(task_id):
+                        continue
+                    if session_id and session_id[:8] not in fname.name:
+                        continue
+                    try:
+                        matching.append(json.loads(fname.read_text(encoding='utf-8')))
+                    except Exception:
+                        continue
+                self.send_json({'results': matching})
+            except Exception as e:
+                self.send_json({'ok': False, 'error': str(e)}, 500)
+
+        else:
+            self.send_error(404)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='三省六部看板服务器')
+    parser.add_argument('--port', type=int, default=7891)
+    parser.add_argument('--host', default='0.0.0.0')
+    parser.add_argument('--cors', default=None, help='Allowed CORS origin (default: reflect request Origin header)')
+    args = parser.parse_args()
+
+    global ALLOWED_ORIGIN, _DASHBOARD_PORT, _DEFAULT_ORIGINS
+    ALLOWED_ORIGIN = args.cors
+    _DASHBOARD_PORT = args.port
+    _DEFAULT_ORIGINS = _DEFAULT_ORIGINS | {
+        f'http://127.0.0.1:{args.port}', f'http://localhost:{args.port}',
+    }
+
+    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    log.info(f'三省六部看板启动 → http://{args.host}:{args.port}')
+    print(f'   按 Ctrl+C 停止')
+
+    auth_init(DATA)
+    if auth_enabled():
+        log.info('🔒 JWT 认证已启用')
+    else:
+        log.info('🔓 认证未配置，所有 API 公开访问（POST /api/auth/setup 设置密码）')
+
+    migrate_notification_config()
+
+    # 启动恢复：重新派发上次被 kill 中断的 queued 任务
+    threading.Timer(3.0, _startup_recover_queued_dispatches).start()
+
+    # 定时巡检：每 120 秒自动扫描停滞任务并触发重试/升级/回滚
+    # 停滞阈值：600秒（10分钟）—— LLM Agent处理复杂任务需要5-10分钟
+    def _periodic_scheduler_scan():
+        while True:
+            try:
+                import time as _time
+                _time.sleep(120)
+                result = handle_scheduler_scan(threshold_sec=600)
+                count = result.get('count', 0) if isinstance(result, dict) else 0
+                if count > 0:
+                    log.info(f'🔍 定时巡检：{count} 个动作')
+            except Exception as e:
+                log.warning(f'定时巡检异常: {e}')
+    threading.Thread(target=_periodic_scheduler_scan, daemon=True).start()
+    log.info('🔍 定时巡检已启动（每120秒，停滞阈值600秒）')
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print('\n已停止')
+
+
+if __name__ == '__main__':
+    main()

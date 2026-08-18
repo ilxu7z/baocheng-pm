@@ -1,4 +1,5 @@
 # Feature Specification: 三省六部 → 现代化组织改名（方案2·彻底）
+> 🏁 **状态: 已落地**（JJC-20260801-005 验证通过，本 spec 为历史契约留存）
 
 **Branch**: `feat/six-unity`（实际实施分支）
 **Created**: 2026-08-01
