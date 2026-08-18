@@ -1009,6 +1009,7 @@ ORG_LEGACY_MAP = {
     '尚书令': '调度长',  '朝报官': '运维专员',
     '礼部尚书': '内容负责人', '户部尚书': '交付负责人', '兵部尚书': '开发负责人',
     '刑部尚书': '质控负责人', '工部尚书': '设计负责人', '吏部尚书': '人力路由负责人',
+    '三省-军师': '规划部', '三省-研发主管': '开发部',  # 历史怪值归一化（P1-2 2a）
 }
 
 
@@ -1164,7 +1165,7 @@ def _scan_actual_agent_ids():
 
 
 _SESSIONS_CACHE = {}
-_SESSIONS_CACHE_TTL = 2.0
+_SESSIONS_CACHE_TTL = 12.0  # 会话映射缓存 TTL（秒），10-15s 合理，避免频繁拉全量 session
 
 def _get_sessions_cache():
     entry = _SESSIONS_CACHE.get('sessions_mapping')
@@ -1205,19 +1206,34 @@ def get_sessions_mapping():
     if cached is not None:
         return cached
 
-    # 1. 获取 session 列表
+    # 1. 获取 session 列表（全量拉取：hasMore 循环 + limit 兜底，避免 --limit 50 静默截断）
     sessions = []
+    total_sessions = 0
     try:
-        r = subprocess.run(
-            ['openclaw', 'sessions', 'list', '--all-agents', '--json', '--limit', '50'],
-            capture_output=True, text=True, timeout=30
-        )
-        if r.returncode == 0 and r.stdout.strip():
+        # openclaw sessions list 无 offset 分页参数，采用：limit ≥ totalCount（如 300）拉全量
+        # 并处理 hasMore 标志：若仍 hasMore=True 则继续放大 limit 拉取，直至拉全，防静默截断
+        limit = 300
+        max_guard = 3  # 防止异常死循环，最多放大 3 次
+        for _ in range(max_guard):
+            r = subprocess.run(
+                ['openclaw', 'sessions', 'list', '--all-agents', '--json', '--limit', str(limit)],
+                capture_output=True, text=True, timeout=30
+            )
+            if r.returncode != 0 or not r.stdout.strip():
+                break
             data = json.loads(r.stdout)
             if isinstance(data, list):
                 sessions = data
+                total_sessions = len(data)
+                break
             elif isinstance(data, dict):
-                sessions = data.get('sessions', data.get('data', []))
+                cur = data.get('sessions', data.get('data', []))
+                sessions = cur
+                total_sessions = int(data.get('totalCount') or len(cur))
+                if data.get('hasMore') and len(cur) < total_sessions:
+                    limit = max(limit * 2, total_sessions + 50)  # 放大 limit 继续拉全
+                    continue
+                break
     except Exception as e:
         log.warning(f'sessions-mapping: openclaw sessions list 失败: {e}')
         return {'ok': False, 'error': str(e)[:200]}
@@ -1280,15 +1296,16 @@ def get_sessions_mapping():
             task = next((t for t in tasks if t.get('id') == tid), None)
             if not task:
                 continue
-            task_org = task.get('org', '')
+            task_org = _modern(task.get('org', ''))  # org 归一化（历史古名→现代名，怪值如三省-军师命中映射）
             # org→agent ids 映射：如果 session 的 agentId 在任务省份的 agent 列表中
             if task_org and agent_id and court_to_agents.get(task_org):
                 if agent_id in court_to_agents[task_org]:
                     matched_task = tid
                     break
-            # spawnedBy 匹配省份中的某个 agent
-            if task_org and spawned_by and court_to_agents.get(task_org):
-                if spawned_by in court_to_agents[task_org]:
+            # spawnedBy 匹配省份中的某个 agent（spawnedBy 实际形如 agent:main:main，取裸 id 后匹配）
+            spawned_by_bare = spawned_by.split(':')[1] if isinstance(spawned_by, str) and spawned_by.count(':') >= 1 else spawned_by
+            if task_org and spawned_by_bare and court_to_agents.get(task_org):
+                if spawned_by_bare in court_to_agents[task_org]:
                     matched_task = tid
                     break
             # session label 包含 task id
@@ -1312,7 +1329,7 @@ def get_sessions_mapping():
 
     # 4. 构建返回结果
     result_tasks = [tinfo for tinfo in task_map.values() if tinfo['sessions']]
-    result = {'ok': True, 'tasks': result_tasks, 'totalSessions': len(sessions)}
+    result = {'ok': True, 'tasks': result_tasks, 'totalSessions': total_sessions, 'returnedSessions': len(sessions)}
 
     _set_sessions_cache(result)
     return result
