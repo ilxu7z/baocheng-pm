@@ -313,6 +313,9 @@
     .archive-bar .ab-deep-clean{font-size:11px;padding:4px 12px;border-radius:6px;border:1px solid #ff527044;background:transparent;cursor:pointer;color:#ff5270;font-weight:600;transition:all .15s}
     .archive-bar .ab-deep-clean:hover{background:#200a10;border-color:#ff5270}
     .archive-bar .ab-deep-clean:disabled{opacity:0.5;cursor:not-allowed}
+    .archive-bar .ab-auto-clean{font-size:11px;padding:4px 12px;border-radius:6px;border:1px solid #ff9a6a44;background:transparent;cursor:pointer;color:#ff9a6a;font-weight:600;transition:all .15s}
+    .archive-bar .ab-auto-clean:hover{background:#201208;border-color:#ff9a6a}
+    .archive-bar .ab-auto-clean:disabled{opacity:0.5;cursor:not-allowed}
     .global-scan-detail{display:none;margin-top:-4px;margin-bottom:12px;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
     .global-scan-detail.open{display:block}
     .global-scan-detail .gs-empty{font-size:11px;color:var(--muted)}
@@ -727,6 +730,7 @@
       <button class="ab-scan" id="btn-global-scan" onclick="runGlobalSchedulerScan()">🧭 总控巡检</button>
       <button class="ab-unstuck" id="btn-smart-unstuck" onclick="runSmartUnstuck()">🪄 智能解卡</button>
       <button class="ab-deep-clean" id="btn-deep-clean" onclick="runDeepClean()">🧹 深度清理</button>
+      <button class="ab-auto-clean" id="btn-auto-clean" onclick="runAutoClean()">🧽 一键清理</button>
       <span class="ab-scan-status" id="global-scan-status">未巡检</span>
       <button class="ab-scan-detail" id="btn-global-scan-detail" onclick="toggleGlobalScanDetails()" style="display:none">查看巡检详情</button>
       <button class="ab-scan-copy" id="btn-global-scan-copy" onclick="copyGlobalScanReport()" style="display:none">📋 复制巡检报告</button>
@@ -3131,6 +3135,34 @@ async function runDeepClean(){
       loadAll();
     }else{
       toast(r.error || '深度清理失败', 'err');
+    }
+  }catch(e){
+    toast('服务器连接失败', 'err');
+  }finally{
+    btn.disabled = false;
+    btn.textContent = oldText;
+  }
+}
+
+async function runAutoClean(){
+  if(!confirm('🧽 一键清理：将删除所有已完成/已取消的任务，并归档中断的AUTO残留任务。\n\n不删除、不取消任何进行中的真实任务。继续吗？')) return;
+  const btn = document.getElementById('btn-auto-clean');
+  if(!btn) return;
+  const oldText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '⟳ 清理中...';
+  try{
+    const r = await postJ(API + '/auto-clean', {});
+    if(r.ok){
+      const removed = r.removedCount || 0;
+      const archived = r.archivedCount || 0;
+      let msg = `🧽 一键清理完成：删除 ${removed} 个已完成/已取消任务`;
+      if(archived > 0) msg += ` · 归档 ${archived} 个AUTO残留`;
+      if(removed === 0 && archived === 0) msg = '🧽 一键清理完成：无需处理';
+      toast(msg, 'ok');
+      loadAll();
+    }else{
+      toast(r.error || '一键清理失败', 'err');
     }
   }catch(e){
     toast('服务器连接失败', 'err');

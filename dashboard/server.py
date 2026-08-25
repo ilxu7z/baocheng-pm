@@ -2297,6 +2297,63 @@ def handle_deep_clean():
     }
 
 
+def handle_auto_clean():
+    """一键清理：整理看板任务列表（不杀进程、不动会话）。
+
+    规则：
+    1. 终态（Done/Cancelled）且未归档的任务 → 直接删除（等效于批量归档，
+       但不受「先归档再批量删」的前置条件限制，一次到位）。
+    2. AUTO 残留任务（JJC-AUTO-* 且 sourceMeta.abortedLastRun=True，
+       状态 Blocked/非终态且停滞）→ 标记归档 + 停调度器，避免挂在活跃视图。
+    3. 非终态、非 AUTO 的真实任务 → 一律不动（需要人工决策，不自动取消）。
+    """
+    now_dt = datetime.datetime.now(datetime.timezone.utc)
+    archived_tasks = []
+    removed_tasks = []
+
+    def _clean(tasks):
+        nonlocal archived_tasks, removed_tasks
+        kept = []
+        for task in tasks:
+            task_id = task.get('id', '')
+            state = task.get('state', '')
+            is_auto = str(task_id).startswith('JJC-AUTO')
+            source_meta = task.get('sourceMeta') or {}
+
+            # 规则1：终态未归档 → 删除
+            if state in _TERMINAL_STATES and not task.get('archived'):
+                removed_tasks.append({'taskId': task_id, 'title': (task.get('title') or '')[:50], 'state': state})
+                log.info(f'auto-clean: 删除终态任务 {task_id} ({state})')
+                continue
+
+            # 规则2：AUTO 残留（中断的 sub-agent 会话）→ 归档 + 停调度器
+            if is_auto and source_meta.get('abortedLastRun'):
+                if state not in _TERMINAL_STATES:
+                    task['archived'] = True
+                    task['archivedAt'] = now_iso()
+                    task['state'] = 'Cancelled'
+                    task['now'] = '🧹 一键清理：AUTO残留任务自动归档（原状态: {}）'.format(state)
+                    _scheduler_add_flow(task, '🧹 auto-clean: AUTO残留任务归档（abortedLastRun）')
+                    task['updatedAt'] = now_iso()
+                    archived_tasks.append({'taskId': task_id, 'title': (task.get('title') or '')[:50], 'oldState': state})
+                    log.info(f'auto-clean: 归档AUTO残留 {task_id} (原 {state})')
+                    continue
+
+            kept.append(task)
+        return kept
+
+    modify_tasks(_clean)
+
+    return {
+        'ok': True,
+        'removed': removed_tasks,
+        'archived': archived_tasks,
+        'removedCount': len(removed_tasks),
+        'archivedCount': len(archived_tasks),
+        'checkedAt': now_iso(),
+    }
+
+
 def _collect_message_text(msg):
     """收集消息中的可检索文本，用于 task_id/关键词过滤。"""
     parts = []
@@ -4290,6 +4347,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(result)
             except Exception as e:
                 self.send_json({'ok': False, 'error': f'deep clean failed: {e}'}, 500)
+            return
+
+        if p == '/api/auto-clean':
+            try:
+                result = handle_auto_clean()
+                self.send_json(result)
+            except Exception as e:
+                self.send_json({'ok': False, 'error': f'auto clean failed: {e}'}, 500)
             return
 
         if p == '/api/repair-flow-order':
