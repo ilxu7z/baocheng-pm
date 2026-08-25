@@ -760,6 +760,17 @@
   <!-- ══ 模型配置 ══ -->
   <div class="panel" id="panel-models">
     <div class="sec-title" style="margin-bottom:14px">各部门 · 模型配置 <span style="font-weight:400;text-transform:none;letter-spacing:0;font-size:11px;color:var(--muted)">— 更改后自动生效（热加载，无需重启）</span></div>
+    <div class="batch-model-bar" id="batch-model-bar" style="margin-bottom:16px;padding:14px 16px;border:1px solid var(--line);border-radius:12px;background:var(--panel2)">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <span style="font-size:13px;font-weight:700;color:var(--acc)">⚡ 批量配置默认模型</span>
+        <select id="batch-target" style="font-size:12px;padding:4px 8px;border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--text)"></select>
+        <select id="batch-model" style="font-size:12px;padding:4px 8px;border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--text)"></select>
+        <button class="btn btn-p" id="btn-batch-apply" onclick="applyBatchModel()" style="font-size:12px;padding:5px 14px">⚡ 一键应用</button>
+        <span id="batch-status" style="font-size:11px;color:var(--muted)"></span>
+      </div>
+      <div id="batch-preview" style="margin-top:10px;font-size:11px;color:var(--muted);line-height:1.7"></div>
+      <div id="batch-progress" style="margin-top:8px;font-size:11px"></div>
+    </div>
     <div class="model-grid" id="model-grid"></div>
     <div class="cl-wrap"><div class="cl-title">变更记录</div><div id="cl-list"></div></div>
   </div>
@@ -1978,6 +1989,7 @@ function renderModels(cfg){
   if(!cfg||!cfg.agents){document.getElementById('model-grid').innerHTML='<div class="empty" style="grid-column:1/-1">请确保本地服务器已启动</div>';return}
   const models = getModels(cfg);
   const opts=models.map(m=>`<option value="${m.id}">${m.l} (${m.p})</option>`).join('');
+  renderBatchBar(cfg, models, opts);
   document.getElementById('model-grid').innerHTML=cfg.agents.map(ag=>`
     <div class="mc-card">
       <div class="mc-top"><span class="mc-emoji">${ag.emoji||'🏛️'}</span>
@@ -1999,6 +2011,96 @@ async function applyModel(id){
     if(r.ok){st.className='mc-st ok';st.textContent='✅ 模型已生效（热加载）';toast(id+'模型已更改','ok');setTimeout(()=>loadAgentConfig(),2000)}
     else{st.className='mc-st err';st.textContent='❌ '+( r.error||'错误');b.disabled=false}
   }catch(e){st.className='mc-st err';st.textContent='❌ 无法连接服务器';b.disabled=false}
+}
+
+/* ══ 批量配置默认模型 ══ */
+let batchSelectedAgents = [];  // 当前批量目标 agent id 列表
+function renderBatchBar(cfg, models, opts){
+  const targetSel = document.getElementById('batch-target');
+  const modelSel = document.getElementById('batch-model');
+  const status = document.getElementById('batch-status');
+  if(!targetSel||!modelSel) return;
+  // 目标选项：全部 / 按部门分组（用 role 映射到 registry 部门）
+  const agents = cfg.agents;
+  const ROLE_DEPT = [
+    ['调度长','执行办'],['项目负责人','总办'],['项目总控','总办'],['全能工程师','运维组'],
+    ['规划师','规划部'],['规划','规划部'],['审议官','审议部'],['审计','审议部'],
+    ['派发','人力路由处'],['路由','人力路由处'],['文案','内容部'],['内容','内容部'],
+    ['代码','开发部'],['研发','开发部'],['视觉','设计部'],['设计','设计部'],
+    ['质量','质控部'],['品控','质控部'],['验收','质控部'],['汇总','交付汇总处'],['交付','交付汇总处'],
+    ['运维','运维组'],['主管','其他']
+  ];
+  const deptOf = role => {
+    const r = role||'';
+    for(const [kw, d] of ROLE_DEPT){ if(r.includes(kw)) return d; }
+    return '其他';
+  };
+  const deptGroups = {};
+  agents.forEach(a=>{
+    const dept = deptOf(a.role);
+    (deptGroups[dept]=deptGroups[dept]||[]).push(a.id);
+  });
+  let targetHtml = `<option value="__all__">全部 ${agents.length} 个 Agent</option>`;
+  Object.entries(deptGroups).forEach(([dept, ids])=>{
+    targetHtml += `<option value="${dept}">${dept} (${ids.length})</option>`;
+  });
+  targetSel.innerHTML = targetHtml;
+  // 模型下拉（当前默认模型置顶）
+  const curDefault = cfg.defaultModel || (agents[0]&&agents[0].model) || '';
+  let modelHtml = '';
+  if(curDefault) modelHtml += `<option value="${curDefault}">当前默认: ${curDefault}</option>`;
+  modelHtml += opts;
+  modelSel.innerHTML = modelHtml;
+  targetSel.onchange = ()=>updateBatchPreview(agents);
+  modelSel.onchange = ()=>updateBatchPreview(agents);
+  updateBatchPreview(agents);
+}
+function updateBatchPreview(agents){
+  const targetSel = document.getElementById('batch-target');
+  const preview = document.getElementById('batch-preview');
+  const status = document.getElementById('batch-status');
+  if(!targetSel||!preview) return;
+  const val = targetSel.value;
+  const deptOf = role => {
+    const r = role||'';
+    const MAP = [['调度长','执行办'],['项目负责人','总办'],['项目总控','总办'],['全能工程师','运维组'],['规划师','规划部'],['规划','规划部'],['审议官','审议部'],['审计','审议部'],['派发','人力路由处'],['路由','人力路由处'],['文案','内容部'],['内容','内容部'],['代码','开发部'],['研发','开发部'],['视觉','设计部'],['设计','设计部'],['质量','质控部'],['品控','质控部'],['验收','质控部'],['汇总','交付汇总处'],['交付','交付汇总处'],['运维','运维组'],['主管','其他']];
+    for(const [kw, d] of MAP){ if(r.includes(kw)) return d; }
+    return '其他';
+  };
+  batchSelectedAgents = val==='__all__' ? agents.map(a=>a.id) : agents.filter(a=>{
+    return deptOf(a.role)===val;
+  }).map(a=>a.id);
+  if(status) status.textContent = `已选 ${batchSelectedAgents.length} 个`;
+  preview.innerHTML = batchSelectedAgents.map(id=>{
+    const a = agents.find(x=>x.id===id);
+    return `<span style="display:inline-block;padding:1px 8px;margin:2px;border:1px solid var(--line);border-radius:10px">${a?esc(a.label):id}</span>`;
+  }).join('') || '（无匹配）';
+}
+async function applyBatchModel(){
+  const modelSel = document.getElementById('batch-model');
+  const btn = document.getElementById('btn-batch-apply');
+  const progress = document.getElementById('batch-progress');
+  const status = document.getElementById('batch-status');
+  if(!modelSel||!btn) return;
+  const model = modelSel.value;
+  const targets = batchSelectedAgents;
+  if(!targets.length){ if(status) status.textContent='⚠️ 未选择目标'; return; }
+  if(!confirm(`⚡ 批量设置 ${targets.length} 个 Agent 默认模型为：\n\n${model}\n\n确认应用？`)) return;
+  btn.disabled = true;
+  let ok = 0, fail = 0;
+  progress.innerHTML = '';
+  for(const id of targets){
+    try{
+      const r = await postJ(API+'/set-model',{agentId:id, model});
+      if(r && r.ok){ ok++; progress.innerHTML += `<div style="color:var(--ok)">✅ ${esc(id)} → ${esc(model)}</div>`; }
+      else{ fail++; progress.innerHTML += `<div style="color:var(--danger)">❌ ${esc(id)}: ${esc((r&&r.error)||'未知错误')}</div>`; }
+    }catch(e){ fail++; progress.innerHTML += `<div style="color:var(--danger)">❌ ${esc(id)}: 连接失败</div>`; }
+    await new Promise(res=>setTimeout(res,150)); // 避免打爆后端
+  }
+  btn.disabled = false;
+  if(status) status.textContent = `✅ 完成: ${ok} 成功 / ${fail} 失败`;
+  toast(`⚡ 批量设置完成: ${ok} 成功 / ${fail} 失败`,'ok');
+  setTimeout(()=>loadAgentConfig(), 1500);
 }
 function renderCL(log){
   const el=document.getElementById('cl-list');
