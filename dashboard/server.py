@@ -3740,6 +3740,19 @@ def handle_advance_state(task_id, comment=''):
         next_state, from_dept, to_dept, default_remark = _STATE_FLOW[cur]
         remark = comment or default_remark
 
+        # ── 品控门禁（Review → Done）：必须有品控 PASS 记录，否则拦截 ──
+        # 根因修复 JJC-20260827-001：_STATE_FLOW 硬编码 Review→Done 单步流转，
+        # advance-state 从 Review 直接到 Done 会绕过品控官验收（08:05/08:47 两次误推同源）。
+        # Review 收敛必须走 handle_review_action(approve) 或 /api/qa-result(PASS)。
+        if cur == 'Review' and next_state == 'Done':
+            qa = task.get('qa') or {}
+            has_qa_pass = qa.get('verdict') == 'PASS'
+            if not has_qa_pass:
+                result = {'ok': False, 'error': '品控门禁：任务在 Review 且无品控 PASS 记录，不能直接推进 Done。请先由品控官提交 /api/qa-result (PASS/FAIL) 或经审议部 handle_review_action(approve) 收敛'}
+                _scheduler_mark_progress(task, '品控门禁拦截：Review 无 qa.PASS，禁止直达 Done')
+                task['updatedAt'] = now_iso()
+                return tasks
+
         # ── 六合一门禁钩子（SIX_UNITY 开关，默认过渡模式只留痕不拦截）──
         def _append_flow(entry):
             entry.setdefault('at', now_iso())
